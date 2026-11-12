@@ -2,6 +2,8 @@
 """
 Luces Navideñas para Linux
 ==========================
+Copyright (C) 2026 Wagner. Licencia GPL-3.0-or-later (ver LICENSE).
+
 Bombillitos de Navidad que cuelgan del borde de la pantalla, inspirados en el
 clásico "Holiday Lights" de Windows 95/98, con interfaz y luces modernas.
 
@@ -2563,7 +2565,7 @@ class SettingsWindow(Gtk.Window):
             "• Pon tus villancicos (MIDI, MP3, OGG…) en una carpeta y elígela en «Música».\n\n"
             "Inspirado en el clásico «Holiday Lights» (1994-95) de Don Metzler / Barefoot Productions."
         )
-        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.set_license_type(Gtk.License.GPL_3_0)
         dlg.run()
         dlg.destroy()
 

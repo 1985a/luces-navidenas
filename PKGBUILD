@@ -6,7 +6,7 @@ pkgver=1.6
 pkgrel=1
 pkgdesc="Bombillitos de Navidad en el borde de la pantalla, inspirado en Holiday Lights de Windows 95"
 arch=('any')
-license=('MIT')
+license=('GPL-3.0-or-later')
 depends=('python' 'python-gobject' 'python-cairo' 'gtk3' 'gtk-layer-shell')
 optdepends=('pipewire: música y efectos de sonido (pw-cat, pw-play)'
             'ffmpeg: música en MP3/OGG/FLAC'

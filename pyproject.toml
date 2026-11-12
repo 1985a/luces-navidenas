@@ -2,7 +2,7 @@
 name = "luces-navidenas"
 version = "1.6"
 description = "Bombillitos de Navidad en el borde de la pantalla (Wayland), inspirado en Holiday Lights de Windows 95"
-license = "MIT"
+license = "GPL-3.0-or-later"
 requires-python = ">=3.11"
 
 [tool.ruff]

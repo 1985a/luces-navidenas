@@ -34,4 +34,17 @@ archivo. Cómo está organizado por dentro y por qué: [docs/ARQUITECTURA.md](do
 
 La versión para Windows (Tkinter, instalador NSIS) es un código aparte y no está en este repositorio.
 
-Licencia MIT.
+## Instalar
+
+En Arch Linux, con el paquete de [Releases](https://github.com/1985a/luces-navidenas/releases):
+
+```
+sudo pacman -U luces-navidenas-1.6-1-any.pkg.tar.xz
+```
+
+En otras distribuciones: instala Python 3, PyGObject, pycairo, GTK 3 y gtk-layer-shell, y copia el
+script `luces-navidenas` a una carpeta del `PATH`.
+
+## Licencia
+
+GPL-3.0-or-later. Ver [LICENSE](LICENSE).
