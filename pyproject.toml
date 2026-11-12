@@ -1,0 +1,35 @@
+[project]
+name = "luces-navidenas"
+version = "1.6"
+description = "Bombillitos de Navidad en el borde de la pantalla (Wayland), inspirado en Holiday Lights de Windows 95"
+license = "MIT"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+include = ["luces-navidenas", "tests/*.py"]
+
+[tool.ruff.lint]
+# F: errores reales (nombres sin definir, imports sin usar)   E/W: estilo PEP 8
+# B: posibles fallos   UP: Python moderno   SIM/C4/PIE/PERF/RET/RUF: código más simple y rápido
+# PL: Pylint (complejidad, comparaciones)   ARG: argumentos sin usar
+select = ["F", "E", "W", "B", "UP", "SIM", "C4", "PIE", "PERF", "RET", "RUF", "PL", "ARG", "I"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # textos en español con símbolos (ñ, «», ·, —) a propósito
+    "SIM105",   # try/except/pass se entiende mejor que contextlib.suppress
+    "SIM108",   # un if/else simple se lee mejor que un ternario largo
+    "RET504", "RET505", "RET503",
+    "PERF401",  # bucles explícitos donde se leen mejor que una comprensión
+    "PLR2004",  # números de dibujo (proporciones del bombillo, colores): nombrarlos todos no aclara nada
+    "PLR0913", "PLR0917",  # funciones de dibujo con (cr, tipo, tamaño, color, brillo…): es su naturaleza
+    "PLR0911", "PLR0912", "PLR0915",  # despachadores D-Bus y constructores de la ventana de opciones
+    "PLW0603",  # (sin uso de global; por si acaso)
+    "E402",     # gi.require_version() debe ir antes de importar desde gi.repository
+    
+]
+
+[tool.ruff.lint.per-file-ignores]
+# GTK/D-Bus llaman a los manejadores con argumentos fijos que no siempre se usan
+"luces-navidenas" = ["ARG002", "ARG005"]
+"tests/*" = ["E702", "E701", "PLC0415"]

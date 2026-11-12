@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+/pkg/
+/src/
+*.pkg.tar.zst
+.ruff_cache/
+*.pkg.tar.*
