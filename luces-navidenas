@@ -1,0 +1,2709 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Luces Navideñas para Linux
+==========================
+Bombillitos de Navidad que cuelgan del borde de la pantalla, inspirados en el
+clásico "Holiday Lights" de Windows 95/98, con interfaz y luces modernas.
+
+- Solo Wayland: Sway, Hyprland, river, KDE Plasma… (protocolo wlr-layer-shell).
+- Las luces no capturan el ratón: se puede hacer clic "a través" de ellas.
+
+Uso:
+  luces-navidenas              inicia (o abre las opciones si ya está corriendo)
+  luces-navidenas --opciones   abre la ventana de opciones
+  luces-navidenas --oculto     inicia sin mostrar la ventana de opciones
+  luces-navidenas --alternar   enciende / apaga las luces (útil para un atajo)
+  luces-navidenas --salir      cierra el programa
+"""
+
+import copy
+import json
+import math
+import os
+import random
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+import signal
+import array
+
+import gi
+
+# Solo Wayland: nunca caer en XWayland
+os.environ["GDK_BACKEND"] = "wayland"
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Gio  # noqa: E402
+import cairo  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    GtkLayerShell = None
+    HAS_LAYER_SHELL = False
+
+
+APP_ID = "io.github.lucesnavidenas"
+APP_NAME = "Luces Navideñas"
+VERSION = "1.5"
+BUILD_DATE = "2026-10-19 20:02"  # el PKGBUILD lo reemplaza al compilar el paquete
+
+
+def build_date():
+    if not BUILD_DATE.startswith("@"):
+        return BUILD_DATE
+    try:  # ejecutando desde la carpeta: fecha del archivo
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(os.path.realpath(__file__))))
+    except OSError:
+        return "desconocida"
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "luces-navidenas")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "luces-navidenas")
+AUTOSTART_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                              "autostart", "luces-navidenas.desktop")
+
+BUILTIN_SONG = "__incluido__"
+BUILTIN_SONG_TITLE = "Jingle Bells — campanitas (incluido)"
+
+
+def _default_music_dir():
+    for d in ("~/Música/Navidad", "~/Music/Navidad", "~/Música", "~/Music"):
+        p = os.path.expanduser(d)
+        if os.path.isdir(p):
+            return p
+    return os.path.expanduser("~")
+
+
+DEFAULTS = {
+    "power": True,
+    "mode": "some",
+    "rate": 0.7,
+    "smooth": True,
+    "bulb": "c9",
+    "size": 1.0,
+    "burnt": False,
+    "broken": False,
+    "palette": "clasico",
+    "music": False,
+    "music_dir": _default_music_dir(),
+    "music_skip": [],
+    "volume": 0.7,
+    "fx_volume": 0.5,
+    "effect": "nieve",
+    "effect_on": False,
+    "effect_density": 0.5,
+    "more": False,
+    "warm": True,
+    "sound": False,
+    "tray_leds": True,
+    "sway": False,
+    "fluidez": "auto",
+    "position": "top",
+    "reserve": True,
+    "monitors": "all",
+    "show_options": True,
+    "bg_notice": True,
+    "autostart": False,
+    "seed": 1994,
+}
+
+# Llaves que obligan a recrear las ventanas de las luces
+LAYOUT_KEYS = ("position", "monitors", "size", "more", "reserve")
+
+# --------------------------------------------------------------------------
+# Datos: modos, colores, bombillos, efectos
+# --------------------------------------------------------------------------
+
+MODES = [
+    ("none", "Encendidas fijas"),
+    ("random", "Aleatorio"),
+    ("all", "Todas juntas"),
+    ("chase", "Persecución"),
+    ("alternate", "Alternando"),
+    ("some", "Algunas parpadean"),
+    ("wave", "Ola suave"),
+    ("breathe", "Respirar"),
+]
+CONTINUOUS_MODES = ("wave", "breathe")
+
+
+def _hex(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+PALETTES = [
+    ("clasico", "Multicolor", ["#2f6bff", "#ff3b3b", "#2fdc5a", "#ffd23a", "#36e4f0", "#a855f7", "#ff4fc8"]),
+    ("retro", "Retro 94", ["#ff2020", "#20d040", "#ffe020", "#2080ff", "#a070ff"]),
+    ("navidad", "Navidad", ["#ff3030", "#22d45a"]),
+    ("calido", "Cálido", ["#ffcf8a"]),
+    ("frio", "Frío", ["#dff1ff"]),
+    ("dorado", "Dorado", ["#ffb52e", "#ffd76a"]),
+    ("rojo", "Rojo", ["#ff2d3d"]),
+    ("verde", "Verde", ["#2fe06a"]),
+    ("azul", "Azul", ["#3a7bff", "#5fb6ff"]),
+    ("morado", "Morado", ["#b05cff", "#ff5fd2"]),
+    ("pastel", "Pastel", ["#ff9ec7", "#9ee7ff", "#c9a3ff", "#a8f0b5", "#ffe59e"]),
+    ("arcoiris", "Arcoíris", None),  # animado
+]
+PALETTE_MAP = {k: (n, [_hex(c) for c in cols] if cols else None) for k, n, cols in PALETTES}
+
+BULBS = [
+    ("c9", "Clásica (C9)"),
+    ("mini", "Mini"),
+    ("globo", "Globo LED"),
+    ("estrella", "Estrella"),
+]
+
+EFFECTS = [
+    ("nieve", "Nieve cayendo"),
+    ("ventisca", "Ventisca"),
+    ("copos", "Copos grandes"),
+    ("destellos", "Destellos"),
+]
+
+BULB_UNIT = 20.0  # px, tamaño base del bombillo (a tamaño 1.0)
+TOP_MARGIN = 3.0
+
+
+def rate_to_interval(rate):
+    """0 = lento (≈1.6 s), 1 = rápido (≈0.07 s)."""
+    return 0.07 + 1.5 * (1.0 - rate) ** 1.6
+
+
+def reserved_height(cfg):
+    """Espacio que se reserva (cable + bombillo); el resplandor puede sobresalir sin tapar clics."""
+    u = BULB_UNIT * cfg["size"]
+    return int(TOP_MARGIN + 0.45 * u + 1.65 * u + 2)
+
+
+def strip_height(cfg):
+    u = BULB_UNIT * cfg["size"]
+    return int(TOP_MARGIN + 0.45 * u + 1.65 * u + 1.0 * u)
+
+
+def hash01(a, b):
+    x = (a * 73856093) ^ (b * 19349663) ^ 0x5bd1e995
+    x = (x ^ (x >> 13)) * 0x27d4eb2d
+    return ((x ^ (x >> 15)) & 0xFFFF) / 65535.0
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def mix(c1, c2, t):
+    return tuple(lerp(x, y, t) for x, y in zip(c1, c2))
+
+
+def hsv(h, s, v):
+    i = int(h * 6) % 6
+    f = h * 6 - int(h * 6)
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    return [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i]
+
+
+# --------------------------------------------------------------------------
+# Dibujo de los bombillos
+# --------------------------------------------------------------------------
+
+SOCKETS = {"c9": (0.20, 0.46), "mini": (0.13, 0.40), "globo": (0.16, 0.40), "estrella": (0.13, 0.34)}
+
+
+def glass_path(cr, kind, u):
+    """Traza el vidrio del bombillo. Devuelve (centro_y, radio)."""
+    if kind == "mini":
+        cr.move_to(-0.10 * u, 0.36 * u)
+        cr.curve_to(-0.28 * u, 0.75 * u, -0.22 * u, 1.45 * u, 0, 1.64 * u)
+        cr.curve_to(0.22 * u, 1.45 * u, 0.28 * u, 0.75 * u, 0.10 * u, 0.36 * u)
+        cr.close_path()
+        return 1.0 * u, 0.25 * u
+    if kind == "globo":
+        cr.new_sub_path()
+        cr.arc(0, 0.80 * u, 0.40 * u, 0, 2 * math.pi)
+        cr.close_path()
+        return 0.80 * u, 0.40 * u
+    if kind == "estrella":
+        cx, cy, ro, ri = 0, 0.88 * u, 0.54 * u, 0.23 * u
+        for k in range(10):
+            a = -math.pi / 2 + k * math.pi / 5
+            r = ro if k % 2 == 0 else ri
+            x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+            (cr.move_to if k == 0 else cr.line_to)(x, y)
+        cr.close_path()
+        return cy, 0.42 * u
+    # c9 clásica
+    cr.move_to(-0.17 * u, 0.40 * u)
+    cr.curve_to(-0.53 * u, 0.85 * u, -0.42 * u, 1.42 * u, 0, 1.62 * u)
+    cr.curve_to(0.42 * u, 1.42 * u, 0.53 * u, 0.85 * u, 0.17 * u, 0.40 * u)
+    cr.close_path()
+    return 1.03 * u, 0.36 * u
+
+
+def glass_metrics(kind, u):
+    s = cairo.ImageSurface(cairo.FORMAT_A8, 1, 1)
+    return glass_path(cairo.Context(s), kind, u)
+
+
+_METRIC_CACHE = {}
+
+
+def metrics(kind, u):
+    key = (kind, round(u, 2))
+    if key not in _METRIC_CACHE:
+        _METRIC_CACHE[key] = glass_metrics(kind, u)
+    return _METRIC_CACHE[key]
+
+
+def draw_glow(cr, kind, u, rgb, v):
+    if v <= 0.01:
+        return
+    cy, rad = metrics(kind, u)
+    R = rad * 4.4
+    g = cairo.RadialGradient(0, cy, 0, 0, cy, R)
+    g.add_color_stop_rgba(0.0, rgb[0], rgb[1], rgb[2], 0.55 * v)
+    g.add_color_stop_rgba(0.22, rgb[0], rgb[1], rgb[2], 0.30 * v)
+    g.add_color_stop_rgba(0.55, rgb[0], rgb[1], rgb[2], 0.08 * v)
+    g.add_color_stop_rgba(1.0, rgb[0], rgb[1], rgb[2], 0.0)
+    cr.save()
+    cr.set_operator(cairo.OPERATOR_ADD)
+    cr.set_source(g)
+    cr.arc(0, cy, R, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def _rounded_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_socket(cr, kind, u):
+    sw, sh = SOCKETS[kind]
+    sw, sh = sw * u, sh * u
+    g = cairo.LinearGradient(-sw, 0, sw, 0)
+    g.add_color_stop_rgb(0.0, 0.07, 0.25, 0.13)
+    g.add_color_stop_rgb(0.35, 0.30, 0.62, 0.38)
+    g.add_color_stop_rgb(0.65, 0.16, 0.44, 0.24)
+    g.add_color_stop_rgb(1.0, 0.05, 0.20, 0.10)
+    _rounded_rect(cr, -sw, -0.02 * u, 2 * sw, sh, 0.07 * u)
+    cr.set_source(g)
+    cr.fill()
+    cr.set_source_rgba(0, 0, 0, 0.35)
+    cr.set_line_width(max(0.6, 0.035 * u))
+    for f in (0.35, 0.62):
+        cr.move_to(-sw + 0.02 * u, sh * f)
+        cr.line_to(sw - 0.02 * u, sh * f)
+    cr.stroke()
+    return sh
+
+
+def draw_bulb(cr, kind, u, rgb, v, dead=None):
+    sh = draw_socket(cr, kind, u)
+    dim = tuple(c * 0.28 + 0.03 for c in rgb)
+
+    if dead == "broken":
+        # Vidrio roto: solo queda un pedazo junto al casquillo, y se ve el filamento
+        cr.save()
+        glass_path(cr, kind, u)
+        cr.clip()
+        cr.new_path()
+        y0 = sh + 0.10 * u
+        pts = [(-u, 0), (u, 0), (u, y0 + 0.10 * u), (0.30 * u, y0 + 0.28 * u), (0.12 * u, y0 + 0.08 * u),
+               (-0.02 * u, y0 + 0.34 * u), (-0.16 * u, y0 + 0.12 * u), (-0.30 * u, y0 + 0.26 * u), (-u, y0 + 0.05 * u)]
+        cr.move_to(*pts[0])
+        for p in pts[1:]:
+            cr.line_to(*p)
+        cr.close_path()
+        cr.clip()
+        glass_path(cr, kind, u)
+        cr.set_source_rgba(dim[0], dim[1], dim[2], 0.85)
+        cr.fill_preserve()
+        cr.set_source_rgba(1, 1, 1, 0.18)
+        cr.set_line_width(max(0.5, 0.03 * u))
+        cr.stroke()
+        cr.restore()
+        cr.set_source_rgba(0.65, 0.62, 0.55, 0.9)
+        cr.set_line_width(max(0.6, 0.03 * u))
+        cr.move_to(-0.05 * u, sh)
+        cr.curve_to(-0.07 * u, sh + 0.2 * u, -0.04 * u, sh + 0.35 * u, -0.06 * u, sh + 0.5 * u)
+        cr.move_to(0.05 * u, sh)
+        cr.curve_to(0.07 * u, sh + 0.2 * u, 0.05 * u, sh + 0.33 * u, 0.07 * u, sh + 0.46 * u)
+        cr.stroke()
+        return
+
+    if dead == "burnt":
+        base = mix(rgb, (0.32, 0.30, 0.28), 0.55)
+        dim = tuple(c * 0.40 for c in base)
+        v = 0.0
+
+    cy, rad = glass_path(cr, kind, u)
+    g = cairo.RadialGradient(-0.10 * u, cy - 0.30 * u, 0.02 * u, 0, cy, rad * 1.45)
+    mid = mix(dim, rgb, v)
+    core = mix(mid, (1, 1, 1), 0.72 * v)
+    edge = mix(tuple(c * 0.55 for c in dim), tuple(c * 0.78 for c in rgb), v)
+    g.add_color_stop_rgba(0.0, core[0], core[1], core[2], 0.97)
+    g.add_color_stop_rgba(0.55, mid[0], mid[1], mid[2], 0.95)
+    g.add_color_stop_rgba(1.0, edge[0], edge[1], edge[2], 0.95)
+    cr.set_source(g)
+    cr.fill_preserve()
+    cr.set_source_rgba(0, 0, 0, 0.28)
+    cr.set_line_width(max(0.5, 0.04 * u))
+    cr.stroke()
+
+    if v > 0.05:  # filamento caliente
+        f = cairo.RadialGradient(0, cy - 0.05 * u, 0, 0, cy - 0.05 * u, 0.22 * u)
+        f.add_color_stop_rgba(0, 1, 1, 0.95, 0.65 * v)
+        f.add_color_stop_rgba(1, 1, 1, 0.95, 0)
+        cr.save()
+        cr.set_operator(cairo.OPERATOR_ADD)
+        cr.set_source(f)
+        cr.arc(0, cy - 0.05 * u, 0.22 * u, 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+
+    # reflejo
+    cr.save()
+    cr.translate(-0.13 * u if kind != "estrella" else -0.08 * u, cy - 0.20 * u)
+    cr.rotate(0.18)
+    cr.scale(1, 2.4 if kind in ("c9", "mini") else 1.4)
+    cr.arc(0, 0, 0.06 * u, 0, 2 * math.pi)
+    cr.set_source_rgba(1, 1, 1, 0.22 + 0.28 * v)
+    cr.fill()
+    cr.restore()
+
+    if dead == "burnt":  # hollín
+        s = cairo.RadialGradient(0, sh + 0.12 * u, 0, 0, sh + 0.12 * u, 0.32 * u)
+        s.add_color_stop_rgba(0, 0, 0, 0, 0.55)
+        s.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.save()
+        glass_path(cr, kind, u)
+        cr.clip()
+        cr.set_source(s)
+        cr.paint()
+        cr.restore()
+
+
+# --------------------------------------------------------------------------
+# La tira de luces (se usa en las ventanas sobre el escritorio y en la vista previa)
+# --------------------------------------------------------------------------
+
+class Bulb:
+    __slots__ = ("x", "i", "angle", "dead", "flasher", "phase", "v", "target")
+
+    def __init__(self, x, i, angle, dead, flasher, phase):
+        self.x, self.i, self.angle, self.dead = x, i, angle, dead
+        self.flasher, self.phase = flasher, phase
+        self.v, self.target = 0.0, 0.0
+
+
+SPRITE_LEVELS = 33  # niveles de brillo prerrenderizados (0 = apagado)
+
+
+class BulbSprites:
+    """Cada bombillo se dibuja una sola vez por color y nivel de brillo; luego solo se copia.
+
+    Dibujar desde cero 40-80 bombillos con degradados en cada cuadro tardaba tanto que
+    se perdían cuadros (y la nieve daba tirones al ritmo del parpadeo).
+    """
+
+    def __init__(self):
+        self.cache = {}
+
+    def _surface(self, w, h, sf):
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, int(math.ceil(w * sf))), max(1, int(math.ceil(h * sf))))
+        s.set_device_scale(sf, sf)
+        return s
+
+    def _store(self, key, val):
+        if len(self.cache) > 4000:
+            self.cache.clear()
+        self.cache[key] = val
+        return val
+
+    def glow(self, kind, u, rgb, level, sf):
+        key = ("g", kind, round(u, 2), rgb, level, sf)
+        hit = self.cache.get(key)
+        if hit:
+            return hit
+        cy, rad = metrics(kind, u)
+        R = rad * 4.4
+        size = 2 * R + 4
+        surf = self._surface(size, size, sf)
+        cr = cairo.Context(surf)
+        ox, oy = size / 2, size / 2 - cy
+        cr.translate(ox, oy)
+        draw_glow(cr, kind, u, rgb, level / (SPRITE_LEVELS - 1))
+        surf.flush()
+        return self._store(key, (surf, ox, oy))
+
+    def body(self, kind, u, rgb, level, dead, sf):
+        key = ("b", kind, round(u, 2), rgb, level, dead, sf)
+        hit = self.cache.get(key)
+        if hit:
+            return hit
+        w, h = 1.25 * u + 4, 1.9 * u + 4
+        surf = self._surface(w, h, sf)
+        cr = cairo.Context(surf)
+        ox, oy = w / 2, 0.1 * u + 2
+        cr.translate(ox, oy)
+        draw_bulb(cr, kind, u, rgb, level / (SPRITE_LEVELS - 1), dead)
+        surf.flush()
+        return self._store(key, (surf, ox, oy))
+
+
+SPRITES = BulbSprites()
+
+
+class LightsStrip(Gtk.DrawingArea):
+    def __init__(self, get_cfg, preview=False):
+        super().__init__()
+        self.get_cfg = get_cfg
+        self.preview = preview
+        self.bulbs = []
+        self.layout_sig = None
+        self.spacing = 40.0
+        self.step = None
+        self.last_t = None
+        self.now = 0.0
+        self.force = True
+        self.connect("draw", self.on_draw)
+        self.tick_id = self.add_tick_callback(self.on_tick)
+        self.sleep_id = 0
+
+    # ---- dormir entre parpadeos
+    def wake(self, force=False):
+        """Vuelve a animar (p. ej. tras cambiar una opción)."""
+        if force:
+            self.force = True
+        if self.sleep_id:
+            GLib.source_remove(self.sleep_id)
+            self.sleep_id = 0
+        if self.tick_id is None:
+            self.last_t = None
+            self.tick_id = self.add_tick_callback(self.on_tick)
+
+    def _sleep(self, seconds):
+        """Nada se mueve: soltar el reloj de cuadros hasta el próximo parpadeo."""
+        self.tick_id = None
+
+        def again():
+            self.sleep_id = 0
+            self.wake()
+            return False
+        self.sleep_id = GLib.timeout_add(max(15, int(seconds * 1000)), again)
+
+    def _queue_spans(self, changed, cfg, w, h):
+        """Pide repintar solo las franjas de los bombillos que cambiaron (y sus vecinos)."""
+        u = BULB_UNIT * cfg["size"]
+        R = 1.9 * u + 4
+        spans = []
+        for b in sorted(changed, key=lambda b: b.x):
+            x0, x1 = max(0.0, b.x - R), min(float(w), b.x + R)
+            if spans and x0 <= spans[-1][1] + 2 * R:
+                spans[-1][1] = max(spans[-1][1], x1)
+            else:
+                spans.append([x0, x1])
+        if sum(x1 - x0 + 2 * R for x0, x1 in spans) > 0.5 * w:
+            self.queue_draw()  # cambió casi toda la tira
+            return
+        for x0, x1 in spans:
+            x0 = int(math.floor(x0))
+            self.queue_draw_area(x0, 0, int(math.ceil(x1)) - x0, h)
+
+    # ---- distribución
+    def ensure_layout(self, width, cfg):
+        sig = (int(width), cfg["size"], cfg["more"], cfg["burnt"], cfg["broken"], cfg["seed"])
+        if sig == self.layout_sig:
+            return
+        self.layout_sig = sig
+        u = BULB_UNIT * cfg["size"]
+        sp = u * (1.55 if cfg["more"] else 2.45)
+        n = max(1, int(width // sp))
+        self.spacing = width / n
+        rng = random.Random(cfg["seed"])
+        old = {b.i: b for b in self.bulbs}
+        self.bulbs = []
+        for i in range(n):
+            r_dead = rng.random()
+            rng.random()  # reservado (mantiene la secuencia estable)
+            r_fl = rng.random()
+            angle = math.radians(rng.uniform(-7, 7))
+            dead = None
+            if cfg["burnt"] and r_dead < 0.09:
+                dead = "burnt"
+            elif cfg["broken"] and 0.09 <= r_dead < 0.15:
+                dead = "broken"
+            b = Bulb((i + 0.5) * self.spacing, i, angle, dead, r_fl < 0.35, rng.uniform(0, 6.28))
+            if i in old:
+                b.v = old[i].v
+            self.bulbs.append(b)
+        self.step = None
+        self.force = True
+
+    # ---- animación
+    def on_tick(self, widget, clock):
+        t = clock.get_frame_time() / 1e6
+        dt = 0.016 if self.last_t is None else max(0.0, min(0.1, t - self.last_t))
+        self.last_t = t
+        self.now = t
+        cfg = self.get_cfg()
+        w = self.get_allocated_width()
+        if w <= 1:
+            return True
+        self.ensure_layout(w, cfg)
+
+        mode = cfg["mode"]
+        interval = rate_to_interval(cfg["rate"])
+        on = cfg["power"]
+        changed = self.force
+        self.force = False
+
+        if mode not in CONTINUOUS_MODES:
+            s = int(t / interval)
+            if s != self.step:
+                self.step = s
+                for b in self.bulbs:
+                    i = b.i
+                    if mode == "none":
+                        tg = 1.0
+                    elif mode == "random":
+                        tg = 1.0 if hash01(s, i) < 0.55 else 0.0
+                    elif mode == "all":
+                        tg = 1.0 if s % 2 == 0 else 0.0
+                    elif mode == "chase":
+                        tg = 1.0 if (i - s) % 3 == 0 else 0.0
+                    elif mode == "alternate":
+                        tg = 1.0 if (i + s) % 2 == 0 else 0.0
+                    else:  # some
+                        tg = (1.0 if hash01(s, i) < 0.5 else 0.0) if b.flasher else 1.0
+                    b.target = tg
+        else:
+            speed = 0.6 + cfg["rate"] * 5.0
+            for b in self.bulbs:
+                if mode == "wave":
+                    b.target = 0.12 + 0.88 * (0.5 + 0.5 * math.sin(t * speed * 1.6 - b.i * 0.55))
+                else:
+                    b.target = 0.10 + 0.90 * (0.5 + 0.5 * math.sin(t * speed))
+
+        k = 1.0 - math.exp(-dt / 0.075)
+        Lv = SPRITE_LEVELS - 1
+        moved = []      # bombillos cuyo brillo visible cambió
+        fading = False  # alguno sigue en transición
+        for b in self.bulbs:
+            tg = b.target if (on and not b.dead) else 0.0
+            if mode in CONTINUOUS_MODES and on:
+                nv = tg
+            elif cfg["smooth"] or not on:
+                nv = b.v + (tg - b.v) * k
+                if abs(nv - tg) < 0.004:
+                    nv = tg
+            else:
+                nv = tg
+            if nv != tg:
+                fading = True
+            if int(round(nv * Lv)) != int(round(b.v * Lv)):
+                moved.append(b)
+            b.v = nv
+
+        animating = cfg["sway"] or cfg["palette"] == "arcoiris" or (mode in CONTINUOUS_MODES and on)
+        if changed or animating or (self.preview and moved):
+            self.queue_draw()
+        elif moved:
+            self._queue_spans(moved, cfg, w, self.get_allocated_height())
+        if not animating and not fading and not moved and not changed:
+            # todo quieto: dormir hasta el próximo parpadeo (o 1 s si no parpadea)
+            if on and mode != "none":
+                self._sleep(interval - (t % interval) + 0.002)
+            else:
+                self._sleep(1.0)
+            return False
+        return True
+
+    def bulb_color(self, b, cfg, v=None):
+        v = b.v if v is None else v
+        name, cols = PALETTE_MAP.get(cfg["palette"], PALETTE_MAP["clasico"])
+        if cols is None:
+            hue = round(((self.now * 0.06 + b.i * 0.07) % 1.0) * 96) / 96  # tonos cuantizados (caché)
+            rgb = hsv(hue, 0.85, 1.0)
+        else:
+            rgb = cols[b.i % len(cols)]
+        if cfg.get("warm") and 0.01 < v < 0.98:
+            # Como un incandescente: con poca corriente el filamento da luz ámbar
+            w = (1.0 - v) ** 1.5 * 0.75 * min(1.0, v / 0.08)
+            rgb = mix(rgb, mix(rgb, (1.0, 0.45, 0.12), 0.85), w)
+        return tuple(round(c, 3) for c in rgb)
+
+    # ---- dibujo
+    def on_draw(self, widget, cr):
+        cfg = self.get_cfg()
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        if not self.bulbs:
+            return False
+
+        if self.preview:
+            _rounded_rect(cr, 0, 0, w, h, 12)
+            g = cairo.LinearGradient(0, 0, 0, h)
+            g.add_color_stop_rgb(0, 0.035, 0.06, 0.11)
+            g.add_color_stop_rgb(1, 0.07, 0.10, 0.17)
+            cr.set_source(g)
+            cr.fill_preserve()
+            cr.clip()
+            rng = random.Random(7)
+            for _ in range(int(w / 9)):
+                cr.set_source_rgba(1, 1, 1, rng.uniform(0.15, 0.5))
+                cr.arc(rng.uniform(0, w), rng.uniform(h * 0.45, h), rng.uniform(0.4, 1.1), 0, 6.3)
+                cr.fill()
+            cr.translate(0, 6)
+        elif cfg["position"] == "bottom":
+            cr.translate(0, h)
+            cr.scale(1, -1)
+
+        u = BULB_UNIT * cfg["size"]
+        sag = 0.45 * u
+        top = TOP_MARGIN
+        sp = self.spacing
+        # GTK ya recortó el dibujo a la franja que cambió: solo se dibuja lo que cae en ella
+        R = 1.9 * u + 4
+        cx0, _cy0, cx1, _cy1 = cr.clip_extents()
+
+        # cable
+        n = len(self.bulbs)
+        k0 = max(0, int(cx0 // sp) - 1)
+        k1 = min(n, int(cx1 // sp) + 2)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(k0 * sp, top)
+        for k in range(k0, k1):
+            x0, x1 = k * sp, (k + 1) * sp
+            cx, cy = (x0 + x1) / 2, top + 2 * sag
+            cr.curve_to(x0 + 2 / 3 * (cx - x0), top + 2 / 3 * (cy - top),
+                        x1 + 2 / 3 * (cx - x1), top + 2 / 3 * (cy - top), x1, top)
+        path = cr.copy_path()
+        cr.set_source_rgba(0.04, 0.16, 0.08, 0.95)
+        cr.set_line_width(max(1.6, 0.13 * u))
+        cr.stroke()
+        cr.append_path(path)
+        cr.set_source_rgba(0.35, 0.65, 0.40, 0.55)
+        cr.set_line_width(max(0.6, 0.04 * u))
+        cr.stroke()
+
+        kind = cfg["bulb"]
+        t = self.now
+
+        def place(b):
+            cr.translate(b.x, top + sag)
+            a = b.angle
+            if cfg["sway"]:
+                a += math.radians(5) * math.sin(t * 1.4 + b.phase)
+            cr.rotate(a)
+
+        sf = self.get_scale_factor()
+        L = SPRITE_LEVELS - 1
+        items = []
+        for b in self.bulbs:
+            if b.x < cx0 - R or b.x > cx1 + R:
+                continue
+            level = 0 if b.dead else int(round(b.v * L))
+            items.append((b, level, self.bulb_color(b, cfg, level / L)))
+        cr.set_operator(cairo.OPERATOR_ADD)  # 1ª pasada: resplandor (se suma entre vecinos)
+        for b, level, rgb in items:
+            if level > 0:
+                surf, ox, oy = SPRITES.glow(kind, u, rgb, level, sf)
+                cr.save()
+                place(b)
+                cr.set_source_surface(surf, -ox, -oy)
+                cr.paint()
+                cr.restore()
+        cr.set_operator(cairo.OPERATOR_OVER)  # 2ª pasada: bombillos
+        for b, level, rgb in items:
+            surf, ox, oy = SPRITES.body(kind, u, rgb, level, b.dead, sf)
+            cr.save()
+            place(b)
+            cr.set_source_surface(surf, -ox, -oy)
+            cr.paint()
+            cr.restore()
+        return False
+
+
+# --------------------------------------------------------------------------
+# Ventanas transparentes sobre el escritorio
+# --------------------------------------------------------------------------
+
+def layer_shell_ok():
+    d = Gdk.Display.get_default()
+    if not HAS_LAYER_SHELL or d is None or "Wayland" not in d.__gtype__.name:
+        return False
+    if hasattr(GtkLayerShell, "is_supported"):
+        return GtkLayerShell.is_supported()
+    return True
+
+
+def make_click_through(win):
+    def apply(*_):
+        win.input_shape_combine_region(cairo.Region())
+    win.connect("realize", apply)
+
+
+def prepare_overlay_window(win, monitor, height=None, bottom=False, reserve=0, namespace="luces-navidenas"):
+    """height=None -> pantalla completa (efectos); si no, una tira arriba o abajo."""
+    win.set_app_paintable(True)
+    win.set_decorated(False)
+    win.set_accept_focus(False)
+    screen = win.get_screen()
+    visual = screen.get_rgba_visual()
+    if visual is not None:
+        win.set_visual(visual)
+    GtkLayerShell.init_for_window(win)
+    GtkLayerShell.set_namespace(win, namespace)
+    GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
+    GtkLayerShell.set_monitor(win, monitor)
+    E = GtkLayerShell.Edge
+    anchors = [E.LEFT, E.RIGHT, E.TOP, E.BOTTOM] if not height else \
+        [E.LEFT, E.RIGHT, E.BOTTOM if bottom else E.TOP]
+    for edge in anchors:
+        GtkLayerShell.set_anchor(win, edge, True)
+    # reserve > 0: las ventanas se acomodan debajo de las luces (como una barra)
+    GtkLayerShell.set_exclusive_zone(win, reserve)
+    if hasattr(GtkLayerShell, "set_keyboard_mode"):
+        GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+    else:
+        GtkLayerShell.set_keyboard_interactivity(win, False)
+    if height:
+        win.set_size_request(-1, height)
+    make_click_through(win)
+
+
+class StripWindow(Gtk.Window):
+    def __init__(self, app, monitor):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.app = app
+        cfg = app.cfg
+        self.set_title("Luces Navideñas")
+        h = strip_height(cfg)
+        prepare_overlay_window(self, monitor, height=h, bottom=cfg["position"] == "bottom",
+                               reserve=reserved_height(cfg) if cfg["reserve"] else 0)
+        self.strip = LightsStrip(lambda: self.app.cfg)
+        self.add(self.strip)
+
+
+# --------------------------------------------------------------------------
+# Efectos de pantalla (nieve, destellos)
+# --------------------------------------------------------------------------
+
+class EffectArea(Gtk.DrawingArea):
+    """Nieve y destellos sobre todo el escritorio.
+
+    Solo se redibujan los rectangulitos donde estaba y donde está cada copo
+    (en vez de toda la pantalla en cada cuadro). Así GTK repinta y envía al
+    compositor una fracción mínima de la pantalla y no se salta cuadros.
+    """
+
+    def __init__(self, get_params, get_fps=lambda: 60):
+        super().__init__()
+        self.get_params = get_params
+        self.get_fps = get_fps
+        self.flakes = []
+        self.prev = set()   # bloques ocupados en el cuadro anterior
+        self.sig = None
+        self.last = None
+        self.t = 0.0
+        self.sprites = {}
+        self.connect("draw", self.on_draw)
+        self.add_tick_callback(self.on_tick)
+
+    def reset(self, w, h, kind, density):
+        rng = random.Random()
+        area = w * h
+        base = {"nieve": 7000, "ventisca": 3200, "copos": 26000, "destellos": 9000}[kind]
+        n = int(min(650, max(15, area / base * (0.25 + 1.5 * density))))
+        self.flakes = []
+        for _ in range(n):
+            if kind == "copos":
+                r = rng.uniform(5, 13)
+                vy = rng.uniform(25, 55)
+            elif kind == "destellos":
+                r = rng.uniform(1.2, 3.2)
+                vy = 0
+            else:
+                r = rng.uniform(1.0, 3.6)
+                vy = (18 + r * 16) * (1.9 if kind == "ventisca" else 1.0)
+            self.flakes.append([rng.uniform(0, w), rng.uniform(-h, h), r, vy,
+                                rng.uniform(0, 6.28), rng.uniform(0.4, 1.6), rng.uniform(0.3, 1.0)])
+        self.prev = set()
+        self.queue_draw()  # primer cuadro completo (limpia lo que hubiera)
+
+    # ---- geometría de cada copo
+    def _extent(self, f, kind):
+        if kind == "copos":
+            return f[2] + 2
+        if kind == "destellos":
+            return f[2] * 5 + 2
+        return (f[2] * 1.6 if f[2] > 2.4 else f[2]) + 2
+
+    def _twinkle(self, f, t):
+        return max(0.0, math.sin(t * f[5] * 1.7 + f[4])) ** 6
+
+    TILE = 64  # px: la pantalla se divide en bloques; solo se repintan los que tocan un copo
+
+    def _tiles(self, kind, h, t):
+        T = self.TILE
+        out = set()
+        for f in self.flakes:
+            if kind == "destellos":
+                if self._twinkle(f, t) < 0.02:
+                    continue
+                x, y = f[0], f[1] % h
+            else:
+                x, y = f[0], f[1]
+            e = self._extent(f, kind)
+            x0, x1 = int((x - e) // T), int((x + e) // T)
+            y0, y1 = int((y - e) // T), int((y + e) // T)
+            for ty in range(y0, y1 + 1):
+                for tx in range(x0, x1 + 1):
+                    out.add((tx, ty))
+        return out
+
+    def on_tick(self, widget, clock):
+        t = clock.get_frame_time() / 1e6
+        # tope de cuadros por segundo: en monitores de 120/144 Hz, o en modo ahorro (30)
+        if self.last is not None and t - self.last < 1.0 / self.get_fps() - 0.003:
+            return True
+        dt = 0.016 if self.last is None else max(0.0, min(0.1, t - self.last))
+        self.last, self.t = t, t
+        kind, density = self.get_params()
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        if w < 2:
+            return True
+        sig = (w, h, kind, round(density, 2))
+        if sig != self.sig:
+            self.sig = sig
+            self.reset(w, h, kind, density)
+            return True
+        if kind != "destellos":
+            if kind == "ventisca":
+                wind = 110 + 60 * math.sin(t * 0.35)
+            else:
+                wind = 14 * math.sin(t * 0.2)
+            for f in self.flakes:
+                f[1] += f[3] * dt
+                f[0] += (wind * (f[2] / 3.0) + 18 * math.sin(t * f[5] + f[4])) * dt
+                if f[1] > h + 15:
+                    f[1] = -15
+                    f[0] = random.uniform(-w * 0.2, w)
+                if f[0] > w + 20:
+                    f[0] -= w + 40
+                elif f[0] < -20:
+                    f[0] += w + 40
+        now = self._tiles(kind, h, t)
+        dirty = now | self.prev
+        self.prev = now
+        if dirty:
+            # agrupar bloques contiguos de cada fila en un solo rectángulo
+            T = self.TILE
+            rows = {}
+            for tx, ty in dirty:
+                rows.setdefault(ty, []).append(tx)
+            region = cairo.Region()
+            for ty, xs in rows.items():
+                xs.sort()
+                start = prev = xs[0]
+                for tx in xs[1:] + [None]:
+                    if tx is not None and tx == prev + 1:
+                        prev = tx
+                        continue
+                    region.union(cairo.RectangleInt(start * T, ty * T, (prev - start + 1) * T, T))
+                    if tx is not None:
+                        start = prev = tx
+            self.queue_draw_region(region)
+        return True
+
+    def _sprite(self, r, alpha):
+        """Copo suave prerrenderizado (más barato que un degradado por copo y cuadro)."""
+        key = (round(r * 4), round(alpha * 10))
+        sp = self.sprites.get(key)
+        if sp is None:
+            R = r * 1.6
+            size = int(math.ceil(R * 2)) + 2
+            sp = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+            c = cairo.Context(sp)
+            cx = size / 2
+            g = cairo.RadialGradient(cx, cx, 0, cx, cx, R)
+            g.add_color_stop_rgba(0, 1, 1, 1, 0.9 * alpha + 0.1)
+            g.add_color_stop_rgba(0.6, 1, 1, 1, 0.5 * alpha)
+            g.add_color_stop_rgba(1, 1, 1, 1, 0)
+            c.set_source(g)
+            c.arc(cx, cx, R, 0, 6.3)
+            c.fill()
+            self.sprites[key] = sp
+        return sp
+
+    ROT_STEPS = 30  # el copo tiene simetría de 60°: 30 pasos de 2°
+
+    def _copo(self, r, alpha, ang):
+        """Copo de seis puntas prerrenderizado en 30 ángulos (antes: 18 trazos por copo y cuadro)."""
+        rq, aq = round(r), round(alpha * 10) / 10
+        step = int(round((ang % (math.pi / 3)) / (math.pi / 3) * self.ROT_STEPS)) % self.ROT_STEPS
+        key = ("c", rq, aq, step)
+        sp = self.sprites.get(key)
+        if sp is None:
+            if len(self.sprites) > 3000:
+                self.sprites.clear()
+            size = 2 * rq + 5
+            sp = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+            c = cairo.Context(sp)
+            c.translate(size / 2, size / 2)
+            c.rotate(step * (math.pi / 3) / self.ROT_STEPS)
+            c.set_line_cap(cairo.LINE_CAP_ROUND)
+            c.set_source_rgba(1, 1, 1, 0.55 + 0.35 * aq)
+            c.set_line_width(max(1.0, rq * 0.13))
+            for _k in range(6):
+                c.move_to(0, 0)
+                c.line_to(0, -rq)
+                c.move_to(0, -rq * 0.55)
+                c.line_to(rq * 0.25, -rq * 0.78)
+                c.move_to(0, -rq * 0.55)
+                c.line_to(-rq * 0.25, -rq * 0.78)
+                c.rotate(math.pi / 3)
+            c.stroke()
+            self.sprites[key] = sp
+        return sp
+
+    def on_draw(self, widget, cr):
+        kind, _ = self.get_params()
+        # GTK ya recortó el dibujo a las zonas que cambiaron: solo se limpian esas
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cx0, cy0, cx1, cy1 = cr.clip_extents()
+        t = self.t
+        h = self.get_allocated_height()
+        if kind == "destellos":
+            cr.set_line_width(0.8)
+            for f in self.flakes:
+                a = self._twinkle(f, t)
+                if a < 0.02:
+                    continue
+                x, y, r = f[0], (f[1] % h), f[2] * (0.6 + a)
+                if x + r * 3 < cx0 or x - r * 3 > cx1 or y + r * 3 < cy0 or y - r * 3 > cy1:
+                    continue
+                cr.set_source_rgba(1, 0.96, 0.85, 0.9 * a * f[6])
+                cr.move_to(x - r * 3, y)
+                cr.line_to(x + r * 3, y)
+                cr.move_to(x, y - r * 3)
+                cr.line_to(x, y + r * 3)
+                cr.stroke()
+                cr.arc(x, y, r * 0.7, 0, 6.3)
+                cr.fill()
+            return False
+        if kind == "copos":
+            for f in self.flakes:
+                x, y, r = f[0], f[1], f[2]
+                if x + r < cx0 or x - r > cx1 or y + r < cy0 or y - r > cy1:
+                    continue
+                sp = self._copo(r, f[6], t * 0.4 * (f[5] - 1) + f[4])
+                off = sp.get_width() / 2
+                cr.set_source_surface(sp, x - off, y - off)
+                cr.paint()
+            return False
+        # nieve / ventisca: los grandes desde imágenes en memoria; los pequeños,
+        # agrupados por brillo en un solo trazo (un relleno por grupo, no uno por copo)
+        groups = {}
+        for f in self.flakes:
+            x, y, r = f[0], f[1], f[2]
+            e = r * 1.6
+            if x + e < cx0 or x - e > cx1 or y + e < cy0 or y - e > cy1:
+                continue
+            if r > 2.4:
+                sp = self._sprite(r, f[6])
+                off = sp.get_width() / 2
+                cr.set_source_surface(sp, x - off, y - off)
+                cr.paint()
+            else:
+                groups.setdefault(round(0.55 + 0.4 * f[6], 1), []).append((x, y, r))
+        for alpha, pts in groups.items():
+            cr.set_source_rgba(1, 1, 1, alpha)
+            for x, y, r in pts:
+                cr.new_sub_path()
+                cr.arc(x, y, r, 0, 6.3)
+            cr.fill()
+        return False
+
+
+class EffectWindow(Gtk.Window):
+    def __init__(self, app, monitor, get_params):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_title("Luces Navideñas — efecto")
+        prepare_overlay_window(self, monitor, height=None, namespace="luces-navidenas-efecto")
+        self.add(EffectArea(get_params, app.effect_fps))
+
+
+# --------------------------------------------------------------------------
+# Sonido: villancico incluido, efectos y reproductor de música
+# --------------------------------------------------------------------------
+
+def _write_wav(path, samples, rate):
+    peak = max(1e-6, max(abs(s) for s in samples))
+    norm = 0.85 / peak
+    data = struct.pack("<%dh" % len(samples), *(int(max(-1, min(1, s * norm)) * 32767) for s in samples))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(data)
+
+
+def _bell(buf, rate, start, freq, dur, amp, decay=3.2, partials=((1, 1), (2, 0.45), (3, 0.2), (4.2, 0.12))):
+    n0 = int(start * rate)
+    n = int(dur * rate)
+    two_pi = 2 * math.pi
+    for k in range(n):
+        i = n0 + k
+        if i >= len(buf):
+            break
+        tt = k / rate
+        env = math.exp(-tt * decay) * min(1.0, tt / 0.004)
+        s = 0.0
+        for mult, a in partials:
+            s += a * math.sin(two_pi * freq * mult * tt) * math.exp(-tt * decay * (mult - 1) * 0.6)
+        buf[i] += amp * env * s
+
+
+def generate_sounds():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    rate = 22050
+    song = os.path.join(CACHE_DIR, "jingle-bells.wav")
+    if not os.path.exists(song):
+        N = {"C": 523.25, "D": 587.33, "E": 659.25, "F": 698.46, "G": 783.99}
+        mel = ("E1 E1 E2 E1 E1 E2 E1 G1 C1.5 D.5 E4 F1 F1 F1.5 F.5 F1 E1 E1 E.5 E.5 E1 D1 D1 E1 D2 G2 "
+               "E1 E1 E2 E1 E1 E2 E1 G1 C1.5 D.5 E4 F1 F1 F1.5 F.5 F1 E1 E1 E.5 E.5 G1 G1 F1 D1 C4").split()
+        bass = [130.81, 130.81, 130.81, 130.81, 174.61, 130.81, 146.83, 196.0,
+                130.81, 130.81, 130.81, 130.81, 174.61, 130.81, 196.0, 130.81]
+        beat = 0.30
+        total = 64 * beat + 2.0
+        buf = [0.0] * int(total * rate)
+        t = 0.2
+        for tok in mel:
+            note, d = tok[0], float(tok[1:])
+            _bell(buf, rate, t, N[note], 1.3, 0.55)
+            t += d * beat
+        for m, f in enumerate(bass):
+            for b in (0, 2):
+                _bell(buf, rate, 0.2 + (m * 4 + b) * beat, f, 0.9, 0.28, decay=4.5,
+                      partials=((1, 1), (2, 0.3)))
+        _write_wav(song, buf, rate)
+    tick = os.path.join(CACHE_DIR, "tic.wav")
+    if not os.path.exists(tick):
+        buf = [0.0] * int(0.06 * rate)
+        _bell(buf, rate, 0, 2600, 0.06, 0.4, decay=70, partials=((1, 1), (1.5, 0.5)))
+        _write_wav(tick, buf, rate)
+    for name, notes in (("encender.wav", (1046.5, 1568.0)), ("apagar.wav", (1568.0, 1046.5))):
+        p = os.path.join(CACHE_DIR, name)
+        if not os.path.exists(p):
+            buf = [0.0] * int(0.9 * rate)
+            _bell(buf, rate, 0.0, notes[0], 0.6, 0.5, decay=6)
+            _bell(buf, rate, 0.12, notes[1], 0.75, 0.5, decay=5)
+            _write_wav(p, buf, rate)
+
+
+def _which(*names):
+    for n in names:
+        if shutil.which(n):
+            return n
+    return None
+
+
+def wav_command(path, vol=1.0):
+    p = _which("pw-play", "paplay", "ffplay", "mpv", "aplay")
+    if p == "pw-play":
+        return ["pw-play", "--volume=%.3f" % vol, path]
+    if p == "paplay":
+        return ["paplay", "--volume=%d" % int(vol * 65536), path]
+    if p == "ffplay":
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", str(int(vol * 100)), path]
+    if p == "mpv":
+        return ["mpv", "--no-video", "--really-quiet", "--volume=%d" % int(vol * 100), path]
+    if p == "aplay":
+        return ["aplay", "-q", path]
+    return None
+
+
+def _soundfont():
+    for p in ("/usr/share/soundfonts/default.sf2", "/usr/share/soundfonts/FluidR3_GM.sf2",
+              "/usr/share/sounds/sf2/FluidR3_GM.sf2", "/usr/share/soundfonts/freepats-general-midi.sf2"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def decoder_for(path):
+    """Devuelve (comando, tasa, canales) que decodifica a PCM s16le por stdout, o None.
+
+    Con el audio crudo en nuestras manos, el volumen se aplica aquí mismo y cambia al instante.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    R = 44100
+    if ext in (".mid", ".midi", ".kar"):
+        if shutil.which("timidity"):
+            return ["timidity", "-idqq", "-Or1sl", "-s", str(R), "-o", "-", path], R, 2
+        sf = _soundfont()
+        if shutil.which("fluidsynth") and sf:
+            return ["fluidsynth", "-ni", "-q", "-T", "raw", "-O", "s16", "-r", str(R), "-F", "-", sf, path], R, 2
+        return None
+    if shutil.which("ffmpeg"):
+        return ["ffmpeg", "-nostdin", "-loglevel", "quiet", "-i", path,
+                "-f", "s16le", "-ac", "2", "-ar", str(R), "-"], R, 2
+    if shutil.which("mpv"):
+        return ["mpv", "--no-config", "--really-quiet", "--no-video", "--ao=pcm", "--ao-pcm-file=/dev/stdout",
+                "--ao-pcm-waveheader=no", "--audio-format=s16", "--audio-channels=stereo",
+                "--audio-samplerate=%d" % R, path], R, 2
+    return None
+
+
+def raw_output_for(rate, ch):
+    """Reproductor que acepta PCM s16le crudo por stdin."""
+    if shutil.which("pw-cat"):
+        return ["pw-cat", "--playback", "--raw", "--format=s16", "--rate=%d" % rate, "--channels=%d" % ch,
+                "--media-role=Music", "-P", '{"media.name": "Luces Navideñas", "application.name": "Luces Navideñas"}',
+                "-"]
+    if shutil.which("pacat"):
+        return ["pacat", "--playback", "--raw", "--format=s16le", "--rate=%d" % rate, "--channels=%d" % ch,
+                "--client-name=Luces Navideñas"]
+    if shutil.which("aplay"):
+        return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(rate), "-c", str(ch), "-"]
+    return None
+
+
+AUDIO_ENV = dict(os.environ, LC_NUMERIC="C", LC_ALL="C.UTF-8")
+
+
+MUSIC_EXT = (".mid", ".midi", ".kar", ".mp3", ".ogg", ".oga", ".opus", ".flac", ".wav", ".m4a")
+
+
+def list_songs(folder):
+    songs = [(BUILTIN_SONG, BUILTIN_SONG_TITLE)]
+    try:
+        for f in sorted(os.listdir(folder), key=str.lower):
+            if f.lower().endswith(MUSIC_EXT):
+                songs.append((os.path.join(folder, f), f))
+    except OSError:
+        pass
+    return songs
+
+
+class SoundFx:
+    def __init__(self):
+        self.last = 0.0
+
+    volume = 0.5
+
+    def play(self, name, min_gap=0.0):
+        now = time.monotonic()
+        if now - self.last < min_gap:
+            return
+        self.last = now
+        path = os.path.join(CACHE_DIR, name)
+        if self.volume <= 0.01:
+            return
+        cmd = wav_command(path, self.volume) if os.path.exists(path) else None
+        if cmd:
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, env=AUDIO_ENV)
+            except OSError:
+                pass
+
+
+class MusicPlayer:
+    """Reproduce la lista en bucle: decodificador → volumen (en Python) → PipeWire."""
+
+    CHUNK_FRAMES = 2048  # ≈ 46 ms a 44,1 kHz: el volumen responde casi al instante
+
+    def __init__(self):
+        self.thread = None
+        self.stop_ev = threading.Event()
+        self.procs = []
+        self.tracks = []
+        self.status = ""
+        self.volume = 0.7
+
+    def set_volume(self, vol):
+        self.volume = max(0.0, min(1.0, vol))
+
+    def set_tracks(self, tracks):
+        if tracks != self.tracks:
+            self.tracks = list(tracks)
+            if self.running():
+                self.stop()
+                self.start()
+
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self):
+        if self.running() or not self.tracks:
+            return
+        self.stop_ev.clear()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _kill(self):
+        for p in self.procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+        self.procs = []
+
+    def stop(self):
+        self.stop_ev.set()
+        self._kill()
+        if self.thread:
+            self.thread.join(timeout=2)
+        self.thread = None
+
+    # ---- fuentes de audio
+    def _source(self, path):
+        """Generador de (bytes_pcm, tasa, canales) o None si no se puede decodificar."""
+        if path.lower().endswith(".wav"):
+            try:
+                w = wave.open(path, "rb")
+                if w.getsampwidth() == 2:
+                    rate, ch = w.getframerate(), w.getnchannels()
+
+                    def gen():
+                        with w:
+                            while not self.stop_ev.is_set():
+                                data = w.readframes(self.CHUNK_FRAMES)
+                                if not data:
+                                    return
+                                yield data
+                    return gen(), rate, ch
+                w.close()
+            except (OSError, wave.Error, EOFError):
+                pass
+        dec = decoder_for(path)
+        if not dec:
+            return None
+        cmd, rate, ch = dec
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, start_new_session=True, env=AUDIO_ENV)
+        except OSError:
+            return None
+        self.procs.append(p)
+        size = self.CHUNK_FRAMES * ch * 2
+
+        def gen():
+            while not self.stop_ev.is_set():
+                data = p.stdout.read(size)
+                if not data:
+                    return
+                yield data
+        return gen(), rate, ch
+
+    def _scale(self, data, gain):
+        if gain >= 0.999:
+            return data
+        if len(data) % 2:
+            data = data[:-1]
+        a = array.array("h")
+        a.frombytes(data)
+        if sys.byteorder != "little":
+            a.byteswap()
+        if gain <= 0.001:
+            return bytes(len(data))
+        a = array.array("h", [int(x * gain) for x in a])
+        if sys.byteorder != "little":
+            a.byteswap()
+        return a.tobytes()
+
+    def _play(self, path):
+        src = self._source(path)
+        if not src:
+            return False
+        chunks, rate, ch = src
+        out_cmd = raw_output_for(rate, ch)
+        if not out_cmd:
+            self.status = "Falta pw-cat (paquete pipewire) para reproducir audio."
+            return False
+        try:
+            out = subprocess.Popen(out_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True, env=AUDIO_ENV)
+        except OSError:
+            return False
+        self.procs.append(out)
+        gain = self.volume ** 2  # curva perceptual: el deslizador se siente más parejo
+        bps = float(rate * ch * 2)
+        written = 0
+        t0 = time.monotonic()
+        try:
+            for data in chunks:
+                # Enviar al ritmo real (máx. 0,2 s adelantado) para que el volumen responda al momento
+                ahead = written / bps - (time.monotonic() - t0)
+                if ahead > 0.2:
+                    if self.stop_ev.wait(ahead - 0.2):
+                        break
+                target = self.volume ** 2
+                gain += (target - gain) * 0.5  # suaviza saltos bruscos
+                out.stdin.write(self._scale(data, gain))
+                out.stdin.flush()
+                written += len(data)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            out.stdin.close()
+        except OSError:
+            pass
+        while out.poll() is None and not self.stop_ev.is_set():
+            time.sleep(0.1)
+        self._kill()
+        return True
+
+    def _loop(self):
+        while not self.stop_ev.is_set():
+            played = False
+            for path in list(self.tracks):
+                if self.stop_ev.is_set():
+                    return
+                real = os.path.join(CACHE_DIR, "jingle-bells.wav") if path == BUILTIN_SONG else path
+                if self._play(real):
+                    played = True
+                    self.stop_ev.wait(0.8)
+            if not played:
+                if not self.status:
+                    self.status = "No hay forma de reproducir estas canciones."
+                return
+
+
+# --------------------------------------------------------------------------
+# Icono de la bandeja (LEDs que parpadean)
+# --------------------------------------------------------------------------
+
+def render_icon_pixmap(rgb, v, size):
+    """Bombillo como pixmap ARGB32 en orden de red (lo que pide StatusNotifierItem)."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    u = size * 0.40
+    cr.translate(size / 2, size * 0.10)
+    cr.rotate(math.radians(-8))
+    draw_glow(cr, "c9", u, rgb, v * 0.8)
+    draw_bulb(cr, "c9", u, rgb, v)
+    surf.flush()
+    data = bytes(surf.get_data())
+    stride = surf.get_stride()
+    out = bytearray()
+    little = sys.byteorder == "little"
+    for y in range(size):
+        row = data[y * stride:y * stride + size * 4]
+        for x in range(0, size * 4, 4):
+            if little:
+                b_, g_, r_, a_ = row[x], row[x + 1], row[x + 2], row[x + 3]
+            else:
+                a_, r_, g_, b_ = row[x], row[x + 1], row[x + 2], row[x + 3]
+            if 0 < a_ < 255:  # quitar el alfa premultiplicado
+                r_, g_, b_ = (min(255, c * 255 // a_) for c in (r_, g_, b_))
+            out += bytes((a_, r_, g_, b_))
+    return (size, size, bytes(out))
+
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+    <signal name="NewIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewTitle"/>
+    <signal name="NewStatus"><arg name="status" type="s"/></signal>
+  </interface>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg type="i" name="parentId" direction="in"/><arg type="i" name="recursionDepth" direction="in"/>
+      <arg type="as" name="propertyNames" direction="in"/>
+      <arg type="u" name="revision" direction="out"/><arg type="(ia{sv}av)" name="layout" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" name="ids" direction="in"/><arg type="as" name="propertyNames" direction="in"/>
+      <arg type="a(ia{sv})" name="properties" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="eventId" direction="in"/>
+      <arg type="v" name="data" direction="in"/><arg type="u" name="timestamp" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" name="events" direction="in"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg type="i" name="id" direction="in"/><arg type="b" name="needUpdate" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" name="ids" direction="in"/>
+      <arg type="ai" name="updatesNeeded" direction="out"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})" name="updatedProps"/><arg type="a(ias)" name="removedProps"/>
+    </signal>
+    <signal name="LayoutUpdated"><arg type="u" name="revision"/><arg type="i" name="parent"/></signal>
+  </interface>
+</node>
+"""
+
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/MenuBar"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class Tray:
+    """Icono de bandeja propio (StatusNotifierItem + dbusmenu), sin libayatana.
+
+    Clic izquierdo: opciones · clic central: encender/apagar ·
+    rueda: volumen de la música · clic derecho: menú (si la bandeja lo admite).
+    """
+
+    MENU = [(1, "power"), (2, "options"), (3, "sep"), (4, "quit")]
+
+    def __init__(self, app):
+        self.app = app
+        self.frame = 0
+        self.last_blink = 0.0
+        self.revision = 1
+        self.bus = None
+        self.registered = False
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error:
+            return
+        cols = [_hex("#ff3b3b"), _hex("#2fdc5a"), _hex("#ffd23a")]
+        # Las imágenes del icono se convierten UNA vez a variantes D-Bus nativas.
+        # (Antes se rearmaban byte a byte en cada consulta de la barra y eso
+        # bloqueaba el hilo principal: la nieve daba tirones al ritmo del parpadeo.)
+        self.frames = [self._pix_variant([render_icon_pixmap(c, 1.0, sz) for sz in (22, 32, 48)]) for c in cols]
+        self.off = self._pix_variant([render_icon_pixmap(cols[0], 0.0, sz) for sz in (22, 32, 48)])
+        node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
+        self.bus.register_object(SNI_PATH, node.interfaces[0], self._on_call, self._get_prop, None)
+        self.bus.register_object(MENU_PATH, node.interfaces[1], self._on_call, self._get_prop, None)
+        self.name = "org.kde.StatusNotifierItem-%d-1" % os.getpid()
+        Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+        Gio.bus_watch_name_on_connection(self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE,
+                                         self._watcher_up, self._watcher_down)
+
+    @staticmethod
+    def _pix_variant(pixmaps):
+        ay = GLib.VariantType.new("ay")
+        items = [GLib.Variant.new_tuple(GLib.Variant("i", w), GLib.Variant("i", h),
+                                        GLib.Variant.new_from_bytes(ay, GLib.Bytes.new(data), True))
+                 for w, h, data in pixmaps]
+        return GLib.Variant.new_array(GLib.VariantType.new("(iiay)"), items)
+
+    @property
+    def available(self):
+        return self.bus is not None
+
+    # ---- registro con la bandeja
+    def _watcher_up(self, conn, name, owner):
+        conn.call(WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+                  GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1, None, None)
+        self.registered = True
+
+    def _watcher_down(self, *_):
+        self.registered = False
+
+    def _emit(self, path, iface, signal_name, params=None):
+        if self.bus:
+            try:
+                self.bus.emit_signal(None, path, iface, signal_name, params)
+            except GLib.Error:
+                pass
+
+    # ---- propiedades
+    def _pixmaps(self):
+        if not self.app.cfg["power"]:
+            return self.off
+        return self.frames[self.frame % 3]
+
+    def _get_prop(self, conn, sender, path, iface, prop):
+        # Solo se construye lo que se pide (la barra consulta varias veces por segundo)
+        if path == MENU_PATH:
+            if prop == "Version":
+                return GLib.Variant("u", 3)
+            if prop == "TextDirection":
+                return GLib.Variant("s", "ltr")
+            if prop == "Status":
+                return GLib.Variant("s", "normal")
+            if prop == "IconThemePath":
+                return GLib.Variant("as", [])
+            return None
+        if prop == "IconPixmap":
+            return self._pixmaps()
+        if prop == "ToolTip":
+            estado = "Luces encendidas" if self.app.cfg["power"] else "Luces apagadas"
+            return GLib.Variant("(sa(iiay)ss)", ("", [], APP_NAME,
+                                estado + "\nClic: opciones · Clic central: encender/apagar"))
+        simple = {
+            "Category": ("s", "ApplicationStatus"), "Id": ("s", "luces-navidenas"),
+            "Title": ("s", APP_NAME), "Status": ("s", "Active"), "WindowId": ("i", 0),
+            "IconName": ("s", ""), "OverlayIconName": ("s", ""), "AttentionIconName": ("s", ""),
+            "ItemIsMenu": ("b", False), "Menu": ("o", MENU_PATH),
+        }
+        if prop in simple:
+            t, v = simple[prop]
+            return GLib.Variant(t, v)
+        return None
+
+    # ---- menú (dbusmenu)
+    def _item_props(self, kind):
+        if kind == "power":
+            return {"label": GLib.Variant("s", "Luces encendidas"),
+                    "toggle-type": GLib.Variant("s", "checkmark"),
+                    "toggle-state": GLib.Variant("i", 1 if self.app.cfg["power"] else 0)}
+        if kind == "options":
+            return {"label": GLib.Variant("s", "Opciones…")}
+        if kind == "sep":
+            return {"type": GLib.Variant("s", "separator")}
+        return {"label": GLib.Variant("s", "Salir")}
+
+    def _layout(self):
+        children = [GLib.Variant("(ia{sv}av)", (i, self._item_props(k), [])) for i, k in self.MENU]
+        return (0, {"children-display": GLib.Variant("s", "submenu")}, children)
+
+    def _menu_event(self, item_id, event):
+        if event != "clicked":
+            return
+        kind = dict(self.MENU).get(item_id)
+        if kind == "power":
+            GLib.idle_add(lambda: self.app.set_power(not self.app.cfg["power"]) and False)
+        elif kind == "options":
+            GLib.idle_add(lambda: self.app.show_settings() and False)
+        elif kind == "quit":
+            GLib.idle_add(lambda: self.app.quit_app() and False)
+
+    # ---- llamadas D-Bus
+    def _on_call(self, conn, sender, path, iface, method, params, inv):
+        ret = None
+        if method == "Activate":
+            GLib.idle_add(lambda: self.app.show_settings() and False)
+        elif method == "SecondaryActivate":
+            GLib.idle_add(lambda: self.app.set_power(not self.app.cfg["power"]) and False)
+        elif method == "ContextMenu":
+            # Bandeja sin menús: mostramos las opciones, que tienen todo
+            GLib.idle_add(lambda: self.app.show_settings() and False)
+        elif method == "Scroll":
+            delta, orient = params.unpack()
+            if orient.lower() == "vertical" and delta:
+                step = -0.05 if delta > 0 else 0.05
+                GLib.idle_add(lambda: self.app.change_volume(step) and False)
+        elif method == "GetLayout":
+            ret = GLib.Variant("(u(ia{sv}av))", (self.revision, self._layout()))
+        elif method == "GetGroupProperties":
+            ids, _names = params.unpack()
+            items = [(i, self._item_props(k)) for i, k in self.MENU if not ids or i in ids]
+            ret = GLib.Variant("(a(ia{sv}))", (items,))
+        elif method == "GetProperty":
+            item_id, name = params.unpack()
+            val = self._item_props(dict(self.MENU).get(item_id, "quit")).get(name, GLib.Variant("s", ""))
+            ret = GLib.Variant("(v)", (val,))
+        elif method == "Event":
+            item_id, event, _data, _ts = params.unpack()
+            self._menu_event(item_id, event)
+        elif method == "EventGroup":
+            for item_id, event, _data, _ts in params.unpack()[0]:
+                self._menu_event(item_id, event)
+            ret = GLib.Variant("(ai)", ([],))
+        elif method == "AboutToShow":
+            ret = GLib.Variant("(b)", (False,))
+        elif method == "AboutToShowGroup":
+            ret = GLib.Variant("(aiai)", ([], []))
+        inv.return_value(ret)
+
+    # ---- estado
+    def sync(self):
+        if not self.bus:
+            return
+        self.revision += 1
+        self._emit(MENU_PATH, "com.canonical.dbusmenu", "LayoutUpdated",
+                   GLib.Variant("(ui)", (self.revision, 0)))
+        self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewIcon")
+        self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewToolTip")
+
+    def blink(self):
+        now = time.monotonic()
+        if not self.bus or now - self.last_blink < 0.6:
+            return
+        self.last_blink = now
+        self.frame += 1
+        self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewIcon")
+
+
+# --------------------------------------------------------------------------
+# Ventana de opciones
+# --------------------------------------------------------------------------
+
+CSS = b"""
+window.luces-settings, window.luces-settings .main {
+    background-color: #0d1416;
+    color: #e8eef0;
+}
+window.luces-settings headerbar {
+    background: linear-gradient(to bottom, #142024, #10191c);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    box-shadow: none;
+}
+window.luces-settings .app-title { font-weight: 800; font-size: 15pt; }
+window.luces-settings .app-subtitle { color: #8fa3a8; font-size: 9pt; }
+window.luces-settings .card {
+    background-color: #142024;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 14px;
+    padding: 14px 16px;
+}
+window.luces-settings .card-title {
+    font-weight: 700;
+    font-size: 10.5pt;
+    color: #f4d58d;
+    margin-bottom: 2px;
+}
+window.luces-settings .hint { color: #7f9499; font-size: 8.5pt; }
+window.luces-settings .mode-btn, window.luces-settings .chip {
+    background: #1a292e;
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 10px;
+    padding: 5px 10px;
+    box-shadow: none;
+    color: #d8e3e6;
+}
+window.luces-settings .mode-btn:hover, window.luces-settings .chip:hover { background: #21343a; }
+window.luces-settings .mode-btn:checked {
+    background: linear-gradient(to right, rgba(229,72,77,0.35), rgba(229,72,77,0.12));
+    border-color: rgba(229,72,77,0.65);
+    color: #ffffff;
+}
+window.luces-settings .chip:checked {
+    background: #22363c;
+    border: 2px solid #f4d58d;
+}
+window.luces-settings .seg button { border-radius: 0; padding: 4px 14px; }
+window.luces-settings .seg button:first-child { border-radius: 9px 0 0 9px; }
+window.luces-settings .seg button:last-child { border-radius: 0 9px 9px 0; }
+window.luces-settings .seg button:checked { background: #c93b40; color: white; }
+window.luces-settings .power {
+    border-radius: 18px;
+    padding: 4px 16px;
+    font-weight: 800;
+    background: #2a1b1d;
+    color: #f0a5a8;
+    border: 1px solid rgba(229,72,77,0.4);
+}
+window.luces-settings .power:checked {
+    background: linear-gradient(to bottom, #2fbf5a, #1f8f41);
+    color: white;
+    border-color: #39d468;
+    box-shadow: 0 0 12px rgba(57,212,104,0.45);
+}
+window.luces-settings .actions {
+    background: #10191c;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    padding: 10px 16px;
+}
+window.luces-settings scale trough { min-height: 6px; border-radius: 3px; }
+window.luces-settings scale highlight { background: #e5484d; border-radius: 3px; }
+window.luces-settings list, window.luces-settings list row { background: transparent; }
+window.luces-settings .songs { background: #10191c; border-radius: 10px; }
+window.luces-settings label { color: #e8eef0; }
+window.luces-settings .hint, window.luces-settings scale marks label { color: #7f9499; }
+window.luces-settings .card-title { color: #f4d58d; }
+window.luces-settings button, window.luces-settings combobox button {
+    background: #1d2d32;
+    background-image: none;
+    color: #e8eef0;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 9px;
+    box-shadow: none;
+    text-shadow: none;
+}
+window.luces-settings button:hover { background: #26393f; }
+window.luces-settings headerbar button.titlebutton { background: transparent; border: none; }
+window.luces-settings switch {
+    background: #2a3a40;
+    background-image: none;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+}
+window.luces-settings switch:checked { background: #2fae55; border-color: #39d468; }
+window.luces-settings switch slider {
+    background: #f2f5f6;
+    background-image: none;
+    border: none;
+    border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+}
+window.luces-settings scale trough { background: #2a3a40; border: none; }
+window.luces-settings scale slider { background: #f2f5f6; background-image: none; border: 3px solid #e5484d; border-radius: 50%; min-width: 16px; min-height: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); }
+window.luces-settings check { background: #1d2d32; border: 1px solid rgba(255,255,255,0.2); }
+window.luces-settings check:checked { background: #e5484d; color: white; border-color: #e5484d; }
+window.luces-settings menu, window.luces-settings .popup menu { background: #142024; color: #e8eef0; }
+window.luces-settings button.suggested-action { background: #c93b40; color: white; border: none; }
+window.luces-settings button.suggested-action:hover { background: #dc4a50; }
+window.luces-settings button.destructive { color: #ff8b8f; }
+"""
+
+
+def _css_with_dialogs(css):
+    """Aplica las mismas reglas a los diálogos (en GTK3 su nodo CSS es «dialog», no «window»)."""
+    out = []
+    for block in css.decode().split("}"):
+        if "{" not in block:
+            out.append(block)
+            continue
+        sel, body = block.split("{", 1)
+        sels = [x.strip() for x in sel.split(",")]
+        sels += [x.replace("window.luces-settings", "dialog.luces-settings") for x in sels
+                 if "window.luces-settings" in x]
+        out.append(", ".join(sels) + " {" + body)
+    extra = ("dialog.luces-settings, dialog.luces-settings > box, dialog.luces-settings .dialog-vbox "
+             "{ background-color: #0d1416; color: #e8eef0; }\n"
+             "dialog.luces-settings .dialog-action-area { padding: 6px 12px 12px 12px; }")
+    return ("}".join(out) + "\n" + extra).encode()
+
+
+class SettingsWindow(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title=APP_NAME)
+        self.app = app
+        app.add_window(self)
+        self.updating = False
+        self.refreshers = []
+        self.snapshot = copy.deepcopy(app.cfg)
+        self.get_style_context().add_class("luces-settings")
+        self.set_default_size(1080, 820)
+        self.set_icon_name("luces-navidenas")
+        self.connect("delete-event", self.on_close)
+
+        # Barra de título
+        hb = Gtk.HeaderBar()
+        hb.set_show_close_button(True)
+        tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        t1 = Gtk.Label(label=APP_NAME)
+        t1.get_style_context().add_class("app-title")
+        t2 = Gtk.Label(label="Bombillitos de Navidad para tu escritorio")
+        t2.get_style_context().add_class("app-subtitle")
+        tbox.pack_start(t1, False, False, 0)
+        tbox.pack_start(t2, False, False, 0)
+        hb.set_custom_title(tbox)
+        self.power_btn = Gtk.ToggleButton()
+        self.power_btn.get_style_context().add_class("power")
+        self.power_btn.connect("toggled", self.on_power)
+        hb.pack_end(self.power_btn)
+        self.set_titlebar(hb)
+        self.refreshers.append(lambda c: (self.power_btn.set_active(c["power"]), self._power_label()))
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.get_style_context().add_class("main")
+        self.add(outer)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer.pack_start(scroll, True, True, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        body.set_border_width(16)
+        scroll.add(body)
+
+        # Vista previa
+        self.preview = LightsStrip(lambda: self.app.cfg, preview=True)
+        body.pack_start(self.preview, False, False, 0)
+        self.refreshers.append(lambda c: self.preview.set_size_request(-1, strip_height(c) + 26))
+
+        grid = Gtk.Grid(column_spacing=14, row_spacing=14, column_homogeneous=True)
+        body.pack_start(grid, False, False, 0)
+
+        grid.attach(self.card_modes(), 0, 0, 1, 1)
+        grid.attach(self.card_speed(), 0, 1, 1, 1)
+        grid.attach(self.card_misc(), 0, 2, 1, 1)
+        grid.attach(self.card_bulbs(), 1, 0, 1, 1)
+        grid.attach(self.card_colors(), 1, 1, 1, 2)
+        grid.attach(self.card_music(), 2, 0, 1, 1)
+        grid.attach(self.card_effect(), 2, 1, 1, 1)
+        grid.attach(self.card_place(), 2, 2, 1, 1)
+
+        # Botones
+        actions = Gtk.Box(spacing=8)
+        actions.get_style_context().add_class("actions")
+        outer.pack_end(actions, False, False, 0)
+        b_help = Gtk.Button(label="Ayuda")
+        b_help.connect("clicked", self.on_help)
+        b_quit = Gtk.Button(label="Salir")
+        b_quit.get_style_context().add_class("destructive")
+        b_quit.set_tooltip_text("Cierra el programa y quita las luces")
+        b_quit.connect("clicked", lambda *_: self.app.quit_app())
+        b_ok = Gtk.Button(label="Aceptar")
+        b_ok.get_style_context().add_class("suggested-action")
+        b_ok.connect("clicked", self.on_ok)
+        b_cancel = Gtk.Button(label="Cancelar")
+        b_cancel.connect("clicked", self.on_cancel)
+        self.b_apply = Gtk.Button(label="Aplicar")
+        self.b_apply.connect("clicked", self.on_apply)
+        actions.pack_start(b_help, False, False, 0)
+        actions.pack_start(b_quit, False, False, 0)
+        ver = Gtk.Label(label="v%s · compilado %s" % (VERSION, build_date()))
+        ver.get_style_context().add_class("hint")
+        ver.set_margin_start(10)
+        actions.pack_start(ver, False, False, 0)
+        actions.pack_end(b_ok, False, False, 0)
+        actions.pack_end(self.b_apply, False, False, 0)
+        actions.pack_end(b_cancel, False, False, 0)
+
+        self.refresh()
+
+    # ---------- ayudantes de construcción
+    def card(self, title, hint=None):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.get_style_context().add_class("card")
+        lbl = Gtk.Label(label=title, xalign=0)
+        lbl.get_style_context().add_class("card-title")
+        box.pack_start(lbl, False, False, 0)
+        if hint:
+            h = Gtk.Label(label=hint, xalign=0)
+            h.set_line_wrap(True)
+            h.get_style_context().add_class("hint")
+            box.pack_start(h, False, False, 0)
+        return box
+
+    def set(self, key, value):
+        if self.updating:
+            return
+        new = copy.deepcopy(self.app.cfg)
+        new[key] = value
+        self.app.apply(new, save=False)
+        self.update_apply()
+
+    def switch_row(self, key, label, tooltip=None):
+        row = Gtk.Box(spacing=10)
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.set_line_wrap(True)
+        sw = Gtk.Switch()
+        sw.set_valign(Gtk.Align.CENTER)
+        sw.connect("notify::active", lambda s, _p: self.set(key, s.get_active()))
+        row.pack_start(lbl, True, True, 0)
+        row.pack_end(sw, False, False, 0)
+        if tooltip:
+            row.set_tooltip_text(tooltip)
+        self.refreshers.append(lambda c: sw.set_active(bool(c[key])))
+        return row, sw
+
+    def combo_row(self, key, label, items):
+        row = Gtk.Box(spacing=10)
+        row.pack_start(Gtk.Label(label=label, xalign=0), False, False, 0)
+        cb = Gtk.ComboBoxText()
+        for k, n in items:
+            cb.append(k, n)
+        cb.connect("changed", lambda c: c.get_active_id() and self.set(key, c.get_active_id()))
+        row.pack_end(cb, False, False, 0)
+        self.refreshers.append(lambda c: cb.set_active_id(c[key]))
+        return row
+
+    def volume_row(self, key, tooltip):
+        row = Gtk.Box(spacing=8)
+        row.set_tooltip_text(tooltip)
+        icon = Gtk.Image()
+        sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
+        sc.set_draw_value(False)
+        pct = Gtk.Label(xalign=1)
+        pct.set_width_chars(4)
+        pct.get_style_context().add_class("hint")
+
+        def show(v):
+            pct.set_text("%d%%" % round(v * 100))
+            name = ("audio-volume-muted-symbolic" if v < 0.01 else "audio-volume-low-symbolic" if v < 0.34
+                    else "audio-volume-medium-symbolic" if v < 0.67 else "audio-volume-high-symbolic")
+            icon.set_from_icon_name(name, Gtk.IconSize.BUTTON)
+
+        def changed(s):
+            v = round(s.get_value(), 2)
+            show(v)
+            self.set(key, v)
+        sc.connect("value-changed", changed)
+        self.refreshers.append(lambda c: (sc.set_value(c[key]), show(c[key])))
+        row.pack_start(icon, False, False, 0)
+        row.pack_start(sc, True, True, 0)
+        row.pack_end(pct, False, False, 0)
+        return row
+
+    def scale_row(self, key, lo, hi, marks):
+        sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, (hi - lo) / 100.0)
+        sc.set_draw_value(False)
+        for v, txt in marks:
+            sc.add_mark(v, Gtk.PositionType.BOTTOM, txt)
+        sc.connect("value-changed", lambda s: self.set(key, round(s.get_value(), 3)))
+        self.refreshers.append(lambda c: sc.set_value(c[key]))
+        return sc
+
+    # ---------- tarjetas
+    def card_modes(self):
+        box = self.card("Modo de parpadeo")
+        grid = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+        group = None
+        btns = {}
+        for n, (key, name) in enumerate(MODES):
+            b = Gtk.RadioButton.new_with_label_from_widget(group, name)
+            group = group or b
+            b.set_mode(False)
+            b.get_style_context().add_class("mode-btn")
+            b.get_child().set_xalign(0)
+            b.connect("toggled", lambda w, k=key: w.get_active() and self.set("mode", k))
+            grid.attach(b, n % 2, n // 2, 1, 1)
+            btns[key] = b
+        box.pack_start(grid, False, False, 0)
+        self.refreshers.append(lambda c: btns.get(c["mode"], btns["some"]).set_active(True))
+        return box
+
+    def card_speed(self):
+        box = self.card("Velocidad")
+        box.pack_start(self.scale_row("rate", 0, 1, [(0, "Lento"), (0.5, None), (1, "Rápido")]), False, False, 0)
+        row, _ = self.switch_row("smooth", "Transición suave",
+                                 "Las luces se encienden y apagan con un desvanecido, como bombillos reales")
+        box.pack_start(row, False, False, 0)
+        return box
+
+    def card_bulbs(self):
+        box = self.card("Bombillos")
+        box.pack_start(self.combo_row("bulb", "Tipo", BULBS), False, False, 0)
+        lbl = Gtk.Label(label="Tamaño", xalign=0)
+        box.pack_start(lbl, False, False, 0)
+        box.pack_start(self.scale_row("size", 0.6, 1.8, [(0.6, "Pequeño"), (1.0, None), (1.8, "Grande")]),
+                       False, False, 0)
+        row, _ = self.switch_row("burnt", "Algunos fundidos")
+        box.pack_start(row, False, False, 0)
+        row, _ = self.switch_row("broken", "Algunos rotos")
+        box.pack_start(row, False, False, 0)
+        shuffle = Gtk.Button(label="Reacomodar al azar")
+        shuffle.set_tooltip_text("Cambia cuáles bombillos parpadean, se funden o están rotos")
+        shuffle.connect("clicked", lambda *_: self.set("seed", random.randint(1, 10 ** 6)))
+        box.pack_start(shuffle, False, False, 0)
+        return box
+
+    def card_colors(self):
+        box = self.card("Color")
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_min_children_per_line(3)
+        flow.set_max_children_per_line(3)
+        flow.set_column_spacing(6)
+        flow.set_row_spacing(6)
+        flow.set_homogeneous(True)
+        group = None
+        btns = {}
+        for key, name, _cols in PALETTES:
+            b = Gtk.RadioButton.new_from_widget(group)
+            group = group or b
+            b.set_mode(False)
+            b.get_style_context().add_class("chip")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            da = Gtk.DrawingArea()
+            da.set_size_request(60, 16)
+            da.connect("draw", self.draw_swatch, key)
+            lbl = Gtk.Label(label=name)
+            lbl.set_ellipsize(3)
+            inner.pack_start(da, False, False, 0)
+            inner.pack_start(lbl, False, False, 0)
+            b.add(inner)
+            b.connect("toggled", lambda w, k=key: w.get_active() and self.set("palette", k))
+            flow.add(b)
+            btns[key] = b
+        box.pack_start(flow, False, False, 0)
+        self.refreshers.append(lambda c: btns.get(c["palette"], btns["clasico"]).set_active(True))
+        return box
+
+    def draw_swatch(self, da, cr, key):
+        w, h = da.get_allocated_width(), da.get_allocated_height()
+        cols = PALETTE_MAP[key][1]
+        n = 5
+        for i in range(n):
+            rgb = cols[i % len(cols)] if cols else hsv(i / n, 0.85, 1.0)
+            x = w / 2 + (i - (n - 1) / 2) * 12
+            g = cairo.RadialGradient(x - 1.5, h / 2 - 1.5, 0, x, h / 2, 6)
+            g.add_color_stop_rgb(0, *mix(rgb, (1, 1, 1), 0.6))
+            g.add_color_stop_rgb(1, *rgb)
+            cr.set_source(g)
+            cr.arc(x, h / 2, 5, 0, 6.3)
+            cr.fill()
+        return False
+
+    def card_music(self):
+        box = self.card("Música")
+        row, _ = self.switch_row("music", "Reproducir música")
+        box.pack_start(row, False, False, 0)
+        box.pack_start(self.volume_row("volume", "Volumen de la música"), False, False, 0)
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sc.set_size_request(-1, 120)
+        sc.get_style_context().add_class("songs")
+        self.song_list = Gtk.ListBox()
+        self.song_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        sc.add(self.song_list)
+        box.pack_start(sc, False, False, 0)
+        frow = Gtk.Box(spacing=8)
+        self.folder_lbl = Gtk.Label(xalign=0)
+        self.folder_lbl.set_ellipsize(1)
+        self.folder_lbl.get_style_context().add_class("hint")
+        fbtn = Gtk.Button(label="Carpeta…")
+        fbtn.connect("clicked", self.on_folder)
+        frow.pack_start(self.folder_lbl, True, True, 0)
+        frow.pack_end(fbtn, False, False, 0)
+        box.pack_start(frow, False, False, 0)
+        self.music_status = Gtk.Label(xalign=0)
+        self.music_status.set_line_wrap(True)
+        self.music_status.get_style_context().add_class("hint")
+        box.pack_start(self.music_status, False, False, 0)
+        self.refreshers.append(self.refresh_songs)
+        return box
+
+    def refresh_songs(self, c):
+        for ch in self.song_list.get_children():
+            self.song_list.remove(ch)
+        skip = set(c.get("music_skip", []))
+        for path, title in list_songs(c["music_dir"]):
+            cb = Gtk.CheckButton(label=title)
+            cb.set_active(path not in skip)
+            cb.connect("toggled", self.on_song_toggled, path)
+            self.song_list.add(cb)
+        self.song_list.show_all()
+        self.folder_lbl.set_text(c["music_dir"].replace(os.path.expanduser("~"), "~", 1))
+        self.folder_lbl.set_tooltip_text(c["music_dir"])
+        midi = shutil.which("timidity") or (shutil.which("fluidsynth") and _soundfont())
+        player = _which("ffmpeg", "mpv")
+        notes = []
+        if not midi:
+            notes.append("Para MIDI instala timidity++ o fluidsynth.")
+        if not player:
+            notes.append("Para MP3/OGG instala ffmpeg o mpv.")
+        if not _which("pw-cat", "pacat", "aplay"):
+            notes.append("Falta pw-cat (paquete pipewire).")
+        self.music_status.set_text(" ".join(notes))
+        self.music_status.set_visible(bool(notes))
+
+    def on_song_toggled(self, cb, path):
+        if self.updating:
+            return
+        skip = set(self.app.cfg.get("music_skip", []))
+        if cb.get_active():
+            skip.discard(path)
+        else:
+            skip.add(path)
+        self.set("music_skip", sorted(skip))
+
+    def on_folder(self, *_):
+        dlg = Gtk.FileChooserDialog(title="Carpeta de música navideña", transient_for=self,
+                                    action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancelar", Gtk.ResponseType.CANCEL, "Elegir", Gtk.ResponseType.ACCEPT)
+        dlg.set_current_folder(self.app.cfg["music_dir"])
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self.set("music_dir", dlg.get_filename())
+            self.updating = True
+            self.refresh_songs(self.app.cfg)
+            self.updating = False
+        dlg.destroy()
+
+    def card_effect(self):
+        box = self.card("Efecto de pantalla")
+        box.pack_start(self.combo_row("effect", "Tipo", EFFECTS), False, False, 0)
+        box.pack_start(Gtk.Label(label="Intensidad", xalign=0), False, False, 0)
+        box.pack_start(self.scale_row("effect_density", 0, 1, [(0, "Poca"), (1, "Mucha")]), False, False, 0)
+        row = Gtk.Box(spacing=10)
+        lbl = Gtk.Label(label="Activar", xalign=0)
+        sw = Gtk.Switch()
+        sw.set_valign(Gtk.Align.CENTER)
+        sw.connect("notify::active", lambda s, _p: self.set("effect_on", s.get_active()))
+        self.refreshers.append(lambda c: sw.set_active(c["effect_on"]))
+        test = Gtk.Button(label="Probar")
+        test.set_tooltip_text("Muestra el efecto durante 10 segundos")
+        test.connect("clicked", lambda *_: self.app.test_effect())
+        row.pack_start(lbl, True, True, 0)
+        row.pack_end(sw, False, False, 0)
+        row.pack_end(test, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        return box
+
+    def card_misc(self):
+        box = self.card("Varios")
+        for key, label, tip in (
+            ("more", "Más luces", "Coloca los bombillos más juntos"),
+            ("warm", "Tono incandescente", "Al atenuarse, los bombillos toman un tono ámbar como los de filamento"),
+            ("sound", "Efectos de sonido", "Un clic suave cuando las luces parpadean"),
+            ("tray_leds", "LEDs en la bandeja", "El icono de la bandeja parpadea con las luces"),
+            ("sway", "Balanceo suave", "Los bombillos se mecen como con brisa"),
+        ):
+            row, sw = self.switch_row(key, label, tip)
+            if key == "tray_leds" and not self.app.tray.available:
+                row.set_sensitive(False)
+                row.set_tooltip_text("No hay conexión con el bus de sesión (D-Bus)")
+            box.pack_start(row, False, False, 0)
+            if key == "sound":
+                box.pack_start(self.volume_row("fx_volume", "Volumen de los efectos de sonido"), False, False, 0)
+        box.pack_start(self.combo_row("fluidez", "Fluidez", [("auto", "Automática"), ("max", "Máxima (60 fps)"),
+                                                            ("eco", "Ahorro (30 fps)")]), False, False, 0)
+        hint = Gtk.Label(label="Automática: 60 fps con cargador, 30 con batería o ahorro de energía.", xalign=0)
+        hint.set_line_wrap(True)
+        hint.get_style_context().add_class("hint")
+        box.pack_start(hint, False, False, 0)
+        return box
+
+    def card_place(self):
+        box = self.card("Ubicación e inicio")
+        row = Gtk.Box(spacing=10)
+        row.pack_start(Gtk.Label(label="Colgar en", xalign=0), True, True, 0)
+        seg = Gtk.Box()
+        seg.get_style_context().add_class("seg")
+        seg.get_style_context().add_class("linked")
+        top = Gtk.RadioButton.new_with_label_from_widget(None, "Arriba")
+        bot = Gtk.RadioButton.new_with_label_from_widget(top, "Abajo")
+        for b, k in ((top, "top"), (bot, "bottom")):
+            b.set_mode(False)
+            b.connect("toggled", lambda w, k=k: w.get_active() and self.set("position", k))
+            seg.pack_start(b, False, False, 0)
+        row.pack_end(seg, False, False, 0)
+        self.refreshers.append(lambda c: (top if c["position"] == "top" else bot).set_active(True))
+        box.pack_start(row, False, False, 0)
+        box.pack_start(self.combo_row("monitors", "Pantallas",
+                                      [("all", "Todas"), ("primary", "Solo la principal")]), False, False, 0)
+        row, _ = self.switch_row("reserve", "No tapar las ventanas",
+                                 "Reserva el espacio de las luces, como una barra: las ventanas "
+                                 "maximizadas empiezan debajo de ellas")
+        box.pack_start(row, False, False, 0)
+        row, _ = self.switch_row("autostart", "Iniciar con la sesión")
+        box.pack_start(row, False, False, 0)
+        row, _ = self.switch_row("show_options", "Mostrar opciones al iniciar")
+        box.pack_start(row, False, False, 0)
+        row, _ = self.switch_row("bg_notice", "Avisar al cerrar la ventana")
+        box.pack_start(row, False, False, 0)
+        return box
+
+    # ---------- estado
+    def refresh(self):
+        self.updating = True
+        for f in self.refreshers:
+            f(self.app.cfg)
+        self.updating = False
+        self.update_apply()
+
+    def update_apply(self):
+        self.b_apply.set_sensitive(self.app.cfg != self.app.saved_cfg)
+
+    def _power_label(self):
+        self.power_btn.set_label("⏻  Encendidas" if self.power_btn.get_active() else "⏻  Apagadas")
+
+    def on_power(self, btn):
+        self._power_label()
+        if not self.updating:
+            self.app.set_power(btn.get_active())
+
+    def open(self):
+        self.snapshot = copy.deepcopy(self.app.cfg)
+        self.refresh()
+        self.show_all()
+        self.music_status.set_visible(bool(self.music_status.get_text()))
+        self.present()
+
+    def on_apply(self, *_):
+        self.app.save()
+        self.snapshot = copy.deepcopy(self.app.cfg)
+        self.update_apply()
+
+    def on_ok(self, *_):
+        self.app.save()
+        self.close_to_background()
+
+    def on_cancel(self, *_):
+        self.app.apply(copy.deepcopy(self.snapshot), save=True)
+        self.refresh()
+        self.close_to_background()
+
+    def on_close(self, *_):
+        self.app.save()
+        self.close_to_background()
+        return True
+
+    def close_to_background(self):
+        """Oculta la ventana; las luces siguen. Avisa cómo volver (una vez, salvo que lo pidan de nuevo)."""
+        if not self.app.cfg.get("bg_notice", True):
+            self.hide()
+            GLib.timeout_add(1500, lambda: trim_memory() and False)
+            return
+        dlg = Gtk.Dialog(transient_for=self, modal=True, title=APP_NAME)
+        dlg.get_style_context().add_class("luces-settings")
+        dlg.set_resizable(False)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(18)
+        head = Gtk.Box(spacing=14)
+        bulb = Gtk.DrawingArea()
+        bulb.set_size_request(40, 56)
+
+        def draw_icon(w, cr):
+            cr.translate(20, 4)
+            draw_glow(cr, "c9", 24, _hex("#ffd23a"), 1.0)
+            draw_bulb(cr, "c9", 24, _hex("#ffd23a"), 1.0)
+            return False
+        bulb.connect("draw", draw_icon)
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<span size='large' weight='bold'>Luces Navideñas sigue funcionando\nen segundo plano</span>")
+        head.pack_start(bulb, False, False, 0)
+        head.pack_start(title, True, True, 0)
+        body = Gtk.Label(xalign=0)
+        body.set_line_wrap(True)
+        body.set_max_width_chars(52)
+        body.set_markup(
+            "Las luces se quedan encendidas aunque cierres esta ventana.\n\n"
+            "<b>Para volver a abrir las opciones:</b>\n"
+            "  •  haz clic en el bombillo de la bandeja, o\n"
+            "  •  vuelve a ejecutar <tt>luces-navidenas</tt> (lanzador o terminal).\n\n"
+            "<b>Para cerrarlo del todo:</b> botón «Salir» o <tt>luces-navidenas --salir</tt>.")
+        chk = Gtk.CheckButton(label="No volver a mostrar este aviso")
+        area.pack_start(head, False, False, 0)
+        area.pack_start(body, False, False, 0)
+        area.pack_start(chk, False, False, 4)
+        dlg.add_button("Salir del programa", 1)
+        ok = dlg.add_button("Entendido", Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg.show_all()
+        resp = dlg.run()
+        dont = chk.get_active()
+        dlg.destroy()
+        if dont:
+            new = copy.deepcopy(self.app.cfg)
+            new["bg_notice"] = False
+            self.app.apply(new, save=True)
+        if resp == 1:
+            self.app.quit_app()
+        else:
+            self.hide()
+            GLib.timeout_add(1500, lambda: trim_memory() and False)
+
+    def on_help(self, *_):
+        dlg = Gtk.AboutDialog(transient_for=self, modal=True)
+        dlg.set_program_name(APP_NAME)
+        dlg.set_version("Versión %s · compilado el %s" % (VERSION, build_date()))
+        dlg.set_logo_icon_name("luces-navidenas")
+        dlg.set_comments(
+            "Bombillitos de Navidad que cuelgan del borde de tu pantalla.\n\n"
+            "• Las luces no estorban: puedes hacer clic a través de ellas.\n"
+            "• Apágalas o enciéndelas con «luces-navidenas --alternar» (ideal para un atajo de teclado).\n"
+            "• Pon tus villancicos (MIDI, MP3, OGG…) en una carpeta y elígela en «Música».\n\n"
+            "Inspirado en el clásico «Holiday Lights» (1994-95) de Don Metzler / Barefoot Productions."
+        )
+        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.run()
+        dlg.destroy()
+
+
+# --------------------------------------------------------------------------
+# Aplicación
+# --------------------------------------------------------------------------
+
+def load_config():
+    cfg = copy.deepcopy(DEFAULTS)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k in cfg and type(v) is type(cfg[k]) or (k in cfg and isinstance(cfg[k], float) and isinstance(v, int)):
+                cfg[k] = v
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def write_autostart(enabled):
+    if enabled:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        exe = shutil.which("luces-navidenas") or os.path.abspath(sys.argv[0])
+        with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=%s\nComment=Luces de Navidad en el escritorio\n"
+                    "Exec=%s --oculto\nIcon=luces-navidenas\nX-GNOME-Autostart-enabled=true\n" % (APP_NAME, exe))
+    else:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except OSError:
+            pass
+
+
+def on_battery_or_saver():
+    """True si el equipo funciona con batería o el perfil de energía es «ahorro»."""
+    # 1) perfil de energía (power-profiles-daemon / tuned-ppd)
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        for name, path in (("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles"),
+                           ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles")):
+            try:
+                r = bus.call_sync(name, path, "org.freedesktop.DBus.Properties", "Get",
+                                  GLib.Variant("(ss)", (name, "ActiveProfile")), None,
+                                  Gio.DBusCallFlags.NONE, 300, None)
+                if r.unpack()[0] == "power-saver":
+                    return True
+                break
+            except GLib.Error:
+                continue
+    except GLib.Error:
+        pass
+    # 2) ¿hay cargador y está desconectado?
+    base = "/sys/class/power_supply"
+    try:
+        mains = []
+        for d in os.listdir(base):
+            try:
+                with open(os.path.join(base, d, "type")) as f:
+                    if f.read().strip() != "Mains":
+                        continue
+                with open(os.path.join(base, d, "online")) as f:
+                    mains.append(f.read().strip() == "1")
+            except OSError:
+                continue
+        return bool(mains) and not any(mains)
+    except OSError:
+        return False
+
+
+def trim_memory():
+    """Devuelve al sistema la memoria libre del proceso (tras cerrar las opciones)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.started = False
+        self.cfg = load_config()
+        self.saved_cfg = copy.deepcopy(self.cfg)
+        self.strips = []
+        self.effects = []
+        self.test_until = 0.0
+        self.settings = None
+        self.tray = None
+        self.sfx = SoundFx()
+        self.sfx.volume = self.cfg["fx_volume"]
+        self.music = MusicPlayer()
+        self.music.volume = self.cfg["volume"]
+        self.last_step = None
+        self.rebuild_id = 0
+        self.saver = False
+        self.gtick_id = 0
+
+    # ---------- arranque
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(_css_with_dialogs(CSS))
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        here = os.path.dirname(os.path.realpath(__file__))
+        if os.path.exists(os.path.join(here, "luces-navidenas.svg")):
+            Gtk.IconTheme.get_default().append_search_path(here)  # ejecutando desde la carpeta
+        if not layer_shell_ok():
+            msg = ("Luces Navideñas necesita una sesión Wayland con soporte de wlr-layer-shell "
+                   "(Sway, Hyprland, river, KDE Plasma…) y el paquete gtk-layer-shell.")
+            print("Error: " + msg, file=sys.stderr)
+            dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE,
+                                    text="No se pueden mostrar las luces")
+            dlg.format_secondary_text(msg)
+            dlg.run()
+            dlg.destroy()
+            sys.exit(1)
+
+    def start(self):
+        self.started = True
+        self.hold()
+        threading.Thread(target=generate_sounds, daemon=True).start()
+        self.tray = Tray(self)
+        self.build_strips()
+        self.update_effect()
+        GLib.timeout_add(1500, self._delayed_music)
+        self.schedule_global_tick()
+        try:  # un adorno no debe competir con lo que el usuario está haciendo
+            os.nice(5)
+        except OSError:
+            pass
+        self.check_power()
+        GLib.timeout_add_seconds(10, self.check_power)
+        GLib.timeout_add_seconds(5, lambda: trim_memory() and False)
+        disp = Gdk.Display.get_default()
+        disp.connect("monitor-added", lambda *_: self.schedule_rebuild())
+        disp.connect("monitor-removed", lambda *_: self.schedule_rebuild())
+
+    def _delayed_music(self):
+        self.update_music()
+        return False
+
+    def do_command_line(self, cl):
+        args = cl.get_arguments()[1:]
+        first = not self.started
+        if "--salir" in args:
+            if self.started:
+                self.quit_app()
+            return 0
+        if first:
+            self.start()
+        if "--alternar" in args:
+            self.set_power(not self.cfg["power"])
+        elif "--opciones" in args:
+            self.show_settings()
+        elif first:
+            if self.cfg["show_options"] and "--oculto" not in args:
+                self.show_settings()
+        elif not args:
+            self.show_settings()
+        return 0
+
+    # ---------- monitores y ventanas
+    def monitors(self):
+        disp = Gdk.Display.get_default()
+        mons = [disp.get_monitor(i) for i in range(disp.get_n_monitors())]
+        if self.cfg["monitors"] == "primary" and mons:
+            p = disp.get_primary_monitor()
+            return [p if p is not None else mons[0]]
+        return mons
+
+    def build_strips(self):
+        for w in self.strips:
+            w.destroy()
+        self.strips = []
+        for m in self.monitors():
+            w = StripWindow(self, m)
+            self.add_window(w)
+            w.show_all()
+            self.strips.append(w)
+
+    def schedule_rebuild(self):
+        if self.rebuild_id:
+            GLib.source_remove(self.rebuild_id)
+
+        def go():
+            self.rebuild_id = 0
+            self.build_strips()
+            self.update_effect(rebuild=True)
+            return False
+        self.rebuild_id = GLib.timeout_add(250, go)
+
+    def effect_params(self):
+        return self.cfg["effect"], self.cfg["effect_density"]
+
+    def update_effect(self, rebuild=False):
+        want = self.cfg["power"] and self.cfg["effect_on"] or time.monotonic() < self.test_until
+        if rebuild or not want:
+            for w in self.effects:
+                w.destroy()
+            self.effects = []
+        if want and not self.effects:
+            for m in self.monitors():
+                w = EffectWindow(self, m, self.effect_params)
+                self.add_window(w)
+                w.show_all()
+                self.effects.append(w)
+
+    def test_effect(self):
+        self.test_until = time.monotonic() + 10
+        self.update_effect()
+
+        def end():
+            self.update_effect()
+            return False
+        GLib.timeout_add(10200, end)
+
+    def update_music(self):
+        skip = set(self.cfg.get("music_skip", []))
+        tracks = [p for p, _ in list_songs(self.cfg["music_dir"]) if p not in skip]
+        self.music.set_tracks(tracks)
+        if self.cfg["music"] and self.cfg["power"]:
+            self.music.start()
+        else:
+            self.music.stop()
+
+    # ---------- configuración
+    def apply(self, new, save=False):
+        old = self.cfg
+        self.cfg = new
+        if any(old[k] != new[k] for k in LAYOUT_KEYS):
+            self.schedule_rebuild()
+        if any(old[k] != new[k] for k in ("effect_on", "power")):
+            self.update_effect()
+        if old["volume"] != new["volume"]:
+            self.music.set_volume(new["volume"])
+        self.sfx.volume = new["fx_volume"]
+        if any(old[k] != new[k] for k in ("music", "music_dir", "music_skip", "power")):
+            self.update_music()
+        if old["autostart"] != new["autostart"]:
+            write_autostart(new["autostart"])
+        if old["power"] != new["power"] and new["sound"]:
+            self.sfx.play("encender.wav" if new["power"] else "apagar.wav")
+        if self.tray:
+            self.tray.sync()
+        for w in self.strips:  # cualquier cambio visible: redibujar las luces enseguida
+            w.strip.wake(force=True)
+        if self.settings:
+            self.settings.preview.wake(force=True)
+        if any(old[k] != new[k] for k in ("mode", "rate", "power")):
+            self.schedule_global_tick()
+        if save:
+            self.save()
+
+    def save(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CONFIG_FILE)
+        self.saved_cfg = copy.deepcopy(self.cfg)
+        if self.settings:
+            self.settings.update_apply()
+
+    def set_power(self, on):
+        """El interruptor se aplica y se guarda al momento (sin tocar otros cambios pendientes)."""
+        if on == self.cfg["power"]:
+            return
+        new = copy.deepcopy(self.cfg)
+        new["power"] = on
+        self.apply(new, save=False)
+        self.saved_cfg["power"] = on
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.saved_cfg, f, indent=2, ensure_ascii=False)
+        if self.settings:
+            self.settings.snapshot["power"] = on
+            self.settings.updating = True
+            self.settings.power_btn.set_active(on)
+            self.settings._power_label()
+            self.settings.updating = False
+            self.settings.update_apply()
+
+    # ---------- latido global: sonidos y LEDs de la bandeja
+    def effect_fps(self):
+        f = self.cfg.get("fluidez", "auto")
+        if f == "eco" or (f == "auto" and self.saver):
+            return 30
+        return 60
+
+    def check_power(self):
+        """Cada 10 s: ¿batería o ahorro de energía? (para la fluidez automática)."""
+        def work():
+            val = on_battery_or_saver()
+            GLib.idle_add(lambda: setattr(self, "saver", val) and False)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def schedule_global_tick(self):
+        """Sonido de los parpadeos y LEDs de la bandeja: despierta solo en cada parpadeo."""
+        if self.gtick_id:
+            GLib.source_remove(self.gtick_id)
+        cfg = self.cfg
+        if not cfg["power"] or cfg["mode"] in CONTINUOUS_MODES or cfg["mode"] == "none":
+            delay = 1.0
+        else:
+            iv = rate_to_interval(cfg["rate"])
+            delay = max(0.05, iv - (time.monotonic() % iv) + 0.002)
+        self.gtick_id = GLib.timeout_add(int(delay * 1000), self.global_tick)
+
+    def global_tick(self):
+        self.gtick_id = 0
+        cfg = self.cfg
+        if cfg["power"] and cfg["mode"] not in CONTINUOUS_MODES and cfg["mode"] != "none":
+            s = int(time.monotonic() / rate_to_interval(cfg["rate"]))
+            if s != self.last_step:
+                self.last_step = s
+                if cfg["sound"] and cfg["mode"] in ("all", "alternate", "chase"):
+                    self.sfx.play("tic.wav", min_gap=0.25)
+                if cfg["tray_leds"] and self.tray and self.tray.available:
+                    self.tray.blink()
+        self.schedule_global_tick()
+        return False
+
+    # ---------- ventanas
+    def show_settings(self):
+        if self.settings is None:
+            self.settings = SettingsWindow(self)
+        self.settings.open()
+
+    def change_volume(self, step):
+        new = copy.deepcopy(self.cfg)
+        new["volume"] = round(max(0.0, min(1.0, new["volume"] + step)), 2)
+        self.apply(new, save=True)
+        if self.settings and self.settings.get_visible():
+            self.settings.refresh()
+
+    def quit_app(self):
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
+        self.music.stop()
+        for w in self.strips + self.effects:
+            w.destroy()
+        if self.started:
+            self.release()
+        self.quit()
+
+
+def main():
+    if "-h" in sys.argv or "--ayuda" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        return 0
+    if "--version" in sys.argv:
+        print("%s %s (compilado: %s)" % (APP_NAME, VERSION, build_date()))
+        return 0
+    app = App()
+
+    # Ctrl+C / kill: cerrar limpio (detiene la música) en vez de soltar un traceback
+    def on_signal(*_):
+        GLib.idle_add(lambda: app.quit_app() and False)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    try:
+        return app.run(sys.argv)
+    except KeyboardInterrupt:
+        app.music.stop()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

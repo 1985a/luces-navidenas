@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Luces Navideñas
+GenericName=Luces de Navidad para el escritorio
+Comment=Bombillitos de Navidad que cuelgan del borde de la pantalla
+Exec=luces-navidenas
+Icon=luces-navidenas
+Terminal=false
+Categories=Utility;Amusement;
+Keywords=navidad;christmas;luces;lights;bombillos;holiday;
+StartupNotify=false
+Actions=Alternar;Opciones;Salir;
+
+[Desktop Action Alternar]
+Name=Encender / apagar luces
+Exec=luces-navidenas --alternar
+
+[Desktop Action Opciones]
+Name=Opciones
+Exec=luces-navidenas --opciones
+
+[Desktop Action Salir]
+Name=Salir
+Exec=luces-navidenas --salir
