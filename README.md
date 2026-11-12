@@ -8,6 +8,16 @@ Bombillitos de Navidad que cuelgan del borde de la pantalla, inspirados en el cl
 - 8 modos de parpadeo, 4 tipos de bombillo, 12 paletas, nieve / ventisca / copos / destellos,
   música (villancico incluido o tu carpeta: MIDI, MP3, OGG…), icono en la bandeja con LEDs.
 
+![Luces arriba con nieve cayendo](docs/capturas/escritorio-nieve.png)
+
+| | |
+|---|---|
+| ![Estrellas rojas y verdes con copos grandes](docs/capturas/estrellas-copos.png) | ![Globos en arcoíris colgados abajo](docs/capturas/abajo-arcoiris.png) |
+
+![Los cuatro tipos de bombillo](docs/capturas/bombillos.png)
+
+![Ventana de opciones](docs/capturas/opciones.png)
+
 ## Uso
 
 ```
