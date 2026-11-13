@@ -1,0 +1,6 @@
+# Dependencias de la versión de Windows (fijadas: la bandeja usa detalles internos de pystray 0.19)
+pycairo==1.29.2
+pillow==13.0.0
+pystray==0.19.5
+sv-ttk==2.6.1
+pyinstaller==6.22.3

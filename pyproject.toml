@@ -24,7 +24,7 @@ ignore = [
     "PLR2004",  # números de dibujo (proporciones del bombillo, colores): nombrarlos todos no aclara nada
     "PLR0913", "PLR0917",  # funciones de dibujo con (cr, tipo, tamaño, color, brillo…): es su naturaleza
     "PLR0911", "PLR0912", "PLR0915",  # despachadores D-Bus y constructores de la ventana de opciones
-    "PLW0603",  # (sin uso de global; por si acaso)
+    "PLW0603",  # un global a propósito: el mutex de instancia única vive lo que el proceso
     "E402",     # gi.require_version() debe ir antes de importar desde gi.repository
     
 ]
