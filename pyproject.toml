@@ -8,7 +8,7 @@ requires-python = ">=3.11"
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-include = ["luces-navidenas", "tests/*.py"]
+include = ["luces-navidenas", "nucleo.py", "windows/*.py", "tests/*.py"]
 
 [tool.ruff.lint]
 # F: errores reales (nombres sin definir, imports sin usar)   E/W: estilo PEP 8

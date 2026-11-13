@@ -13,12 +13,13 @@ optdepends=('pipewire: música y efectos de sonido (pw-cat, pw-play)'
             'timidity++: villancicos en MIDI'
             'upower: fluidez automática con batería'
             'power-profiles-daemon: fluidez automática en modo ahorro')
-source=('luces-navidenas' 'luces-navidenas.desktop' 'luces-navidenas.svg' 'LICENSE')
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')  # archivos locales de esta misma carpeta
+source=('luces-navidenas' 'nucleo.py' 'luces-navidenas.desktop' 'luces-navidenas.svg' 'LICENSE')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')  # archivos locales de esta misma carpeta
 
 package() {
   install -Dm755 luces-navidenas "$pkgdir/usr/bin/luces-navidenas"
   sed -i "s/^BUILD_DATE = \"@BUILD_DATE@\"/BUILD_DATE = \"$(date '+%Y-%m-%d %H:%M')\"/" "$pkgdir/usr/bin/luces-navidenas"
+  install -Dm644 nucleo.py "$pkgdir/usr/lib/luces-navidenas/nucleo.py"
   install -Dm644 luces-navidenas.desktop "$pkgdir/usr/share/applications/luces-navidenas.desktop"
   install -Dm644 luces-navidenas.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/luces-navidenas.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
