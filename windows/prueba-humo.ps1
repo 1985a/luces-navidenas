@@ -2,7 +2,6 @@
 # Instala en silencio, arranca, saca capturas, mide CPU, prueba las órdenes y desinstala.
 # Deja capturas y medidas en artefactos\ y falla si algo no responde o queda un error registrado.
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 $out = Join-Path $PWD "artefactos"
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -14,14 +13,9 @@ $log = Join-Path $env:LOCALAPPDATA "LucesNavidenas\registro.txt"
 $report = @()
 
 function Captura($nombre) {
-    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    # CaptureBlt: incluye las ventanas por capas (las luces y la nieve)
-    $op = [System.Drawing.CopyPixelOperation]::SourceCopy -bor [System.Drawing.CopyPixelOperation]::CaptureBlt
-    $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size, $op)
-    $bmp.Save((Join-Path $out "$nombre.png"))
-    $g.Dispose(); $bmp.Dispose()
+    # Pillow captura con SRCCOPY|CAPTUREBLT: incluye las ventanas por capas (las luces y la nieve)
+    python -c "from PIL import ImageGrab; ImageGrab.grab().save(r'$(Join-Path $out "$nombre.png")')"
+    if ($LASTEXITCODE -ne 0) { Write-Host "No se pudo capturar $nombre" }
 }
 
 function Proceso() { Get-Process LucesNavidenas -ErrorAction SilentlyContinue | Select-Object -First 1 }

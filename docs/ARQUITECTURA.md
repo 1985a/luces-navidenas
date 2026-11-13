@@ -1,17 +1,41 @@
 # Arquitectura
 
-Un solo script, `luces-navidenas`, en capas de abajo arriba:
+Tres archivos de código, en capas:
 
-| Capa | Qué hay | Depende de |
+| Archivo | Qué hay | Depende de |
 |---|---|---|
-| Lógica pura | `rate_to_interval`, `blink_target`, `continuous_target`, `fade_toward`, `layout_bulbs`, `sway_redraw_interval`, `rainbow_*`, `sanitize_config`, `desktop_exec_quote` | nada (se prueba en `tests/`) |
-| Dibujo | `draw_bulb`, `draw_glow`, `draw_cable`, `BulbSprites` (caché de sprites) | cairo |
-| Widgets | `LightsStrip` (la tira; también la vista previa), `EffectArea` (nieve) | GTK 3 |
-| Ventanas | `StripWindow`, `EffectWindow` (capa layer-shell, sin entrada), `SettingsWindow` | gtk-layer-shell |
-| Servicios | `MusicPlayer` (hilo), `SoundFx`, `Tray` (StatusNotifierItem propio por D-Bus), `PowerWatcher` | procesos externos, D-Bus |
-| Aplicación | `App`: configuración, latido global (sonido y LEDs de la bandeja), línea de órdenes | todo lo anterior |
+| `nucleo.py` | Datos (modos, paletas, bombillos), lógica pura (`blink_target`, `fade_toward`, `layout_bulbs`, `sway_redraw_interval`, `rainbow_*`, `sanitize_config`…), dibujo con cairo, `BulbSprites`, y los motores sin ventana `StripEngine` (tira) y `EffectEngine` (nieve), sonidos sintetizados | Python + pycairo |
+| `luces-navidenas` | Linux: `LightsStrip`/`EffectArea` (widgets GTK que envuelven los motores), ventanas layer-shell, música con `pw-cat`, bandeja StatusNotifierItem propia, `PowerWatcher`, opciones en GTK | GTK 3, gtk-layer-shell, D-Bus |
+| `windows/luces_navidenas_win.py` | Windows: ventanas por capas de Win32 (`UpdateLayeredWindow`), AppBar para reservar espacio, `Renderer` (hilo de dibujo), música con MCI, efectos con winsound, bandeja con pystray, opciones en Tkinter | ctypes/Win32, Tkinter, pystray |
+
+Lo que se ve es idéntico en los dos sistemas porque lo dibuja el mismo código (`StripEngine.draw`,
+`EffectEngine.draw`); cada sistema solo decide cuándo despertar al motor y dónde presentar el resultado.
+
+### Linux
+
+| Capa | Qué hay |
+|---|---|
+| Widgets | `LightsStrip` (la tira; también la vista previa), `EffectArea` (nieve): conectan el reloj de cuadros de GTK con los motores |
+| Ventanas | `StripWindow`, `EffectWindow` (capa layer-shell, sin entrada), `SettingsWindow` |
+| Servicios | `MusicPlayer` (hilo), `SoundFx`, `Tray` (StatusNotifierItem propio por D-Bus), `PowerWatcher` |
+| Aplicación | `App`: configuración, latido global (sonido y LEDs de la bandeja), línea de órdenes |
+
+### Windows
+
+| Pieza | Qué hace |
+|---|---|
+| `LayeredWindow` | Ventana transparente por píxel, siempre encima, que deja pasar los clics. Su mapa de bits (DIB) es la memoria de una superficie de cairo: se dibuja y se presenta sin copias intermedias |
+| `StripWindow` | Una tira por monitor; si «No tapar las ventanas» está activo, se registra como barra (AppBar) |
+| `EffectWindow` | Nieve sobre un monitor; repinta solo los bloques que cambian |
+| `Renderer` | Hilo de dibujo. Con nieve, al ritmo de la pantalla (`DwmFlush`) con el tope de fps; sin nieve, duerme hasta el próximo cambio que pidan las tiras o hasta que una opción lo despierte |
+| `MessageWindow` | Ventana invisible del hilo de Tk. Bandeja, otra copia del programa (`CommandServer`) y MCI la despiertan con `PostMessage`: nada sondea |
+| `WinMusic` | Lista en bucle con MCI; el fin de cada canción llega como `MM_MCINOTIFY` |
+| `CommandServer` + mutex | Una sola copia: la segunda le pasa sus argumentos a la primera por un socket local con contraseña |
+| `Settings` | Ventana de opciones (Tkinter + sv_ttk); la vista previa solo se anima mientras se ve |
 
 ## Hilos
+
+Linux:
 
 - **Principal (GTK)**: todo el dibujo y la interfaz. Nada bloqueante aquí.
 - **Música** (`MusicPlayer._loop`): decodifica, aplica el volumen y escribe a `pw-cat`.
@@ -19,9 +43,18 @@ Un solo script, `luces-navidenas`, en capas de abajo arriba:
 - **Sonidos** (`generate_sounds`, al arrancar): sintetiza los WAV la primera vez (≈4 s de CPU).
   Avisa con `SOUNDS_READY`; los WAV se escriben a un temporal y se renombran, así nadie lee uno a medias.
 
+Windows:
+
+- **Tk**: interfaz, ventanas Win32 (se crean y destruyen aquí, que es donde se atienden sus mensajes),
+  música MCI y latido de la bandeja.
+- **Dibujo** (`Renderer`): pinta y presenta las ventanas por capas. Comparte con Tk las listas de
+  ventanas bajo `lock`; Tk solo destruye una ventana después de sacarla de la lista.
+- **Bandeja** (pystray) y **órdenes** (`CommandServer`): solo encolan y avisan con `PostMessage`.
+- **Sonidos**: igual que en Linux.
+
 ## Cuándo se redibuja (la regla que manda en el consumo)
 
-La tira es un adorno: debe costar casi nada. `LightsStrip.on_tick` decide en cada cuadro:
+La tira es un adorno: debe costar casi nada. `StripEngine.tick` decide en cada cuadro (en los dos sistemas):
 
 1. **Tope de cuadros**: como mucho 60 por segundo (30 con batería o en «Ahorro»), aunque el
    monitor sea de 120/144 Hz.
@@ -50,7 +83,7 @@ para no tocar la sesión real ni sonar.
 
 ## Reglas de la casa
 
-- Lógica nueva → función pura con prueba en `tests/`.
+- Lógica nueva → en `nucleo.py`, como función pura con prueba en `tests/test_nucleo.py` (corre en Linux y en Windows).
 - Nada de sondeos periódicos si hay eventos: la energía se sigue por señales de UPower y
   power-profiles-daemon (sondeo de sysfs cada 30 s solo si UPower no existe).
 - Todo proceso lanzado se recoge (`wait`) y sus tuberías se cierran; `make test` convierte las
