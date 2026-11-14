@@ -127,8 +127,6 @@ def enable_crash_log():
         os.close(fd)
         enable_crash_log.file = os.fdopen(2, "w", encoding="utf-8", closefd=False)
         faulthandler.enable(file=enable_crash_log.file, all_threads=True)
-        if TRACE:  # diagnóstico: la pila de cada hilo cada 2 s (el último volcado dice dónde estaba al morir)
-            faulthandler.dump_traceback_later(2, repeat=True, file=enable_crash_log.file)
     except OSError:
         pass
 
@@ -610,6 +608,7 @@ class Renderer:
         self.preview_width = None   # None: la ventana de opciones está oculta
         self.preview_size = None
         self.preview_next = 0.0
+        self.stats = {"nieve": 0, "tira": 0, "desde": time.monotonic()}  # cuadros dibujados (traza)
         self.running = True
         self.thread = threading.Thread(target=self._loop, name="dibujo", daemon=True)
         self.thread.start()
@@ -693,11 +692,13 @@ class Renderer:
                     self.last_fx = t
                     for w in effects:
                         w.frame(t, dt)
+                    self.stats["nieve"] += 1
                 next_wait = 1.0
                 for s in self.strips:
                     if t >= s.next_at:
                         if s.engine.frame_due(t, fps):
                             f = s.frame(t)
+                            self.stats["tira"] += f.redraw is not None
                             s.next_at = t + (1.0 / fps if f.busy else f.wait)
                         else:  # tope de fps: esperar a que toque el cuadro
                             s.next_at = s.engine.last_t + 1.0 / fps - 0.003
@@ -706,6 +707,10 @@ class Renderer:
                     if t >= self.preview_next:
                         self.preview_next = t + self._preview(t)
                     next_wait = min(next_wait, self.preview_next - t)
+            if TRACE and t - self.stats["desde"] >= 5:
+                dt = t - self.stats["desde"]
+                trace(f"dibujo: nieve {self.stats['nieve'] / dt:.1f} cuadros/s, tiras {self.stats['tira'] / dt:.1f}/s")
+                self.stats.update(nieve=0, tira=0, desde=t)
             if effects:
                 self._wait_vsync(frame_start)
             elif next_wait >= self.SHORT_WAIT:

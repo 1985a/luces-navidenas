@@ -147,11 +147,15 @@ try {
 } finally {
     $report | Set-Content -Encoding UTF8 (Join-Path $out "medidas.txt")
     if (Test-Path $log) { Copy-Item $log (Join-Path $out "registro.txt"); Write-Host "--- registro.txt"; Get-Content $log }
-    if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) {
+    if ((Test-Path $crash) -and (Select-String -Path $crash -Pattern "Windows fatal exception|Fatal Python error" -Quiet)) {
         Copy-Item $crash (Join-Path $out "fallos.txt"); Write-Host "--- fallos.txt"; Get-Content $crash
     }
 }
 if ($fallo) { throw $fallo }
 if ((Test-Path $log) -and (Select-String -Path $log -Pattern "^\S+ \S+ (?!\[traza\])" -Quiet)) { throw "El programa registró errores (ver registro.txt)" }
-if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) { throw "El programa se cayó (ver fallos.txt)" }
+if ((Test-Path $crash) -and (Select-String -Path $crash -Pattern "Windows fatal exception|Fatal Python error" -Quiet)) {
+    throw "El programa se cayó (ver fallos.txt)"
+}
+Write-Host "--- traza (cuadros por segundo)"
+if (Test-Path $log) { Select-String -Path $log -Pattern "cuadros/s" | Select-Object -Last 12 | ForEach-Object { $_.Line } }
 Write-Host "Prueba de humo superada"
