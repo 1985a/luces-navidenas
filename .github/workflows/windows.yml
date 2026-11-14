@@ -40,6 +40,11 @@ jobs:
       - name: Compilar ejecutable e instalador
         run: python windows/build.py
 
+      - name: Diagnóstico (temporal)
+        shell: pwsh
+        continue-on-error: true
+        run: ./windows/diagnostico.ps1
+
       - name: Prueba de humo (instalar, usar, medir, desinstalar)
         shell: pwsh
         run: ./windows/prueba-humo.ps1
