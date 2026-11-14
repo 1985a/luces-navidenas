@@ -173,9 +173,6 @@ SW_HIDE, SW_SHOWNOACTIVATE = 0, 4
 ULW_ALPHA = 2
 WM_USER, WM_APP = 0x400, 0x8000
 WM_APPBAR = WM_USER + 257
-WM_COMMANDS = WM_APP + 1         # hay órdenes en la cola de la aplicación
-MM_MCINOTIFY = 0x3B9             # MCI: aviso de reproducción
-MCI_NOTIFY_SUCCESSFUL = 1        # … la canción terminó sola (no la detuvimos nosotros)
 WM_DISPLAYCHANGE = 0x7E
 WM_POWERBROADCAST, PBT_APMPOWERSTATUSCHANGE = 0x218, 0xA
 WM_NCHITTEST, HTTRANSPARENT = 0x84, -1
@@ -320,16 +317,11 @@ def _wndproc(hwnd, msg, wparam, lparam):
     try:
         if msg == WM_NCHITTEST:
             return HTTRANSPARENT  # los clics pasan a la ventana de abajo
+        # REGLA: aquí no se llama a tkinter. Esto corre dentro del despacho de mensajes de Tcl, y
+        # una llamada a tkinter desde aquí deja en NULL el estado de Python que _tkinter guarda
+        # para mainloop: la siguiente vez que Tcl llama a Python, el proceso cae (0xC0000005).
+        # Lo que necesite a Tk se encola con app.post(), que lo despierta desde otro hilo.
         app = _app_ref[0]
-        if msg == WM_COMMANDS and app is not None:
-            # No se toca Tk aquí dentro: esto corre en medio del despacho de mensajes de Tcl, y
-            # llamar a Tk de forma reentrante desde ahí lo tumbaba. Se hace en cuanto quede libre.
-            app.root.after_idle(app.drain_commands)
-            return 0
-        if msg == MM_MCINOTIFY and app is not None:
-            if wparam == MCI_NOTIFY_SUCCESSFUL:  # los avisos de «abortada» llegan al cambiar de canción
-                app.music.on_notify()
-            return 0
         obj = _windows.get(hwnd)
         if msg == WM_APPBAR and obj is not None:
             if wparam == ABN_POSCHANGED:
@@ -339,7 +331,7 @@ def _wndproc(hwnd, msg, wparam, lparam):
                 obj.set_fullscreen_hidden(bool(lparam) and mon is not None and foreign_fullscreen(mon["rect"]))
             return 0
         if msg == WM_DISPLAYCHANGE and app is not None:
-            app.schedule_rebuild()
+            app.post("reconstruir")
         elif msg == WM_POWERBROADCAST and wparam == PBT_APMPOWERSTATUSCHANGE and app is not None:
             app.power_changed()
     except Exception:  # una excepción aquí cruzaría a código C: se registra y se sigue
@@ -391,18 +383,38 @@ def list_monitors():
     return mons
 
 
-class MessageWindow:
-    """Ventana invisible (solo mensajes) del hilo de Tk: otros hilos la despiertan con PostMessage."""
+class Messenger:
+    """Despierta al hilo de Tk desde cualquier hilo, sin sondear.
 
-    def __init__(self):
-        self.hwnd = user32.CreateWindowExW(0, CLASS_NAME, APP_NAME, 0, 0, 0, 0, 0, wt.HWND(HWND_MESSAGE),
-                                           None, kernel32.GetModuleHandleW(None), None)
+    Duerme en una cola; por cada aviso hace root.event_generate desde su propio hilo, que es la
+    forma en que tkinter admite avisar entre hilos (con Tcl multihilo, la llamada se pasa al hilo
+    de Tk). Así los avisos pueden salir también de un procedimiento de ventana: ahí solo se encola.
+    """
 
-    def post(self, msg):
-        user32.PostMessageW(self.hwnd, msg, 0, 0)
+    EVENT = "<<Ordenes>>"
 
-    def destroy(self):
-        user32.DestroyWindow(self.hwnd)
+    def __init__(self, root):
+        self.root = root
+        self.q = queue.SimpleQueue()
+        self.thread = threading.Thread(target=self._run, name="mensajero", daemon=True)
+        self.thread.start()
+
+    def wake(self):
+        self.q.put(True)
+
+    def _run(self):
+        while self.q.get():
+            while True:
+                try:
+                    self.root.event_generate(self.EVENT, when="tail")
+                    break
+                except RuntimeError:  # mainloop aún no arrancó: reintentar en un momento
+                    time.sleep(0.2)
+                except tk.TclError:   # Tk ya se cerró
+                    return
+
+    def stop(self):
+        self.q.put(False)
 
 
 # --------------------------------------------------------------------------
@@ -727,12 +739,13 @@ def list_songs(folder):
 class WinMusic:
     """Lista en bucle con MCI (MP3, WMA, WAV… por DirectShow; MIDI por el secuenciador).
 
-    El fin de cada canción llega como mensaje MM_MCINOTIFY a la ventana de mensajes: no hay
-    que preguntar el estado de la reproducción cada poco.
+    Mientras suena, se pregunta el estado una vez por segundo para pasar a la siguiente. (El
+    aviso nativo de MCI llega a un procedimiento de ventana, desde donde no se puede tocar Tk.)
     """
 
     ALIAS = "lucesmusica"
-    GAP_MS = 800  # pausa entre canciones
+    GAP_MS = 800      # pausa entre canciones
+    WATCH_MS = 1000   # cada cuánto se mira si terminó la canción (solo mientras suena)
 
     def __init__(self, app):
         self.app = app
@@ -743,6 +756,7 @@ class WinMusic:
         self.volume = 0.7
         self.has_volume = True
         self.pending = None  # after() de la próxima canción
+        self.watch = None    # after() que vigila el fin de la canción
 
     def set_tracks(self, tracks):
         if tracks != self.tracks:
@@ -767,6 +781,9 @@ class WinMusic:
         if self.pending:
             self.app.root.after_cancel(self.pending)
             self.pending = None
+        if self.watch:
+            self.app.root.after_cancel(self.watch)
+            self.watch = None
         if self.open:
             mci("stop " + self.ALIAS)
             mci("close " + self.ALIAS)
@@ -801,16 +818,23 @@ class WinMusic:
                 continue
             self.open = True
             self.set_volume(self.volume)
-            mci(f"play {self.ALIAS} notify", self.app.msgwin.hwnd)
+            mci(f"play {self.ALIAS}")
+            self.watch = self.app.root.after(self.WATCH_MS, self._check)
             return
         log("Música: ninguna canción de la lista se pudo reproducir.")
 
-    def on_notify(self):
-        """MCI avisó que terminó (o se detuvo) la canción: pasar a la siguiente."""
-        if self.open:
+    def _check(self):
+        """¿Terminó la canción? Entonces cerrar y pasar a la siguiente tras una pausa."""
+        self.watch = None
+        if not self.open:
+            return
+        _err, mode = mci(f"status {self.ALIAS} mode")
+        if mode in ("stopped", ""):
             mci("close " + self.ALIAS)
             self.open = False
-        self._schedule(self.GAP_MS)
+            self._schedule(self.GAP_MS)
+        else:
+            self.watch = self.app.root.after(self.WATCH_MS, self._check)
 
 
 class WinSfx:
@@ -1573,7 +1597,8 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.report_callback_exception = _log_exception
-        self.msgwin = MessageWindow()
+        self.messenger = Messenger(self.root)
+        self.root.bind(Messenger.EVENT, lambda _e: self.drain_commands())
         self.music = WinMusic(self)
         self.music.volume = self.cfg["volume"]
         self.sfx = WinSfx()
@@ -1596,9 +1621,9 @@ class App:
 
     # ---------- órdenes desde otros hilos
     def post(self, *msg):
-        """Seguro desde cualquier hilo: encola y despierta al hilo de Tk con un mensaje de Windows."""
+        """Seguro desde cualquier hilo (y desde un procedimiento de ventana): encola y despierta a Tk."""
         self.queue.put(msg)
-        self.msgwin.post(WM_COMMANDS)
+        self.messenger.wake()
 
     def drain_commands(self):
         while not self.quitting:
@@ -1615,6 +1640,8 @@ class App:
                 self.quit_app()
             elif msg[0] == "args":
                 self.handle_args(msg[1])
+            elif msg[0] == "reconstruir":  # cambió la disposición de los monitores
+                self.schedule_rebuild()
 
     # ---------- monitores y ventanas
     def monitors(self):
@@ -1791,7 +1818,7 @@ class App:
         self.strips, self.effects = [], []
         self.tray.stop()
         self.server.close()
-        self.msgwin.destroy()
+        self.messenger.stop()
         try:
             self.root.destroy()
         except tk.TclError:
