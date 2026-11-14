@@ -127,6 +127,8 @@ def enable_crash_log():
         os.close(fd)
         enable_crash_log.file = os.fdopen(2, "w", encoding="utf-8", closefd=False)
         faulthandler.enable(file=enable_crash_log.file, all_threads=True)
+        if TRACE:  # diagnóstico: la pila de cada hilo cada 2 s (el último volcado dice dónde estaba al morir)
+            faulthandler.dump_traceback_later(2, repeat=True, file=enable_crash_log.file)
     except OSError:
         pass
 
@@ -662,6 +664,7 @@ class Renderer:
         return self.PREVIEW_PERIOD if f.busy else max(self.PREVIEW_PERIOD, f.wait)
 
     def _loop(self):
+        trace("dibujo: hilo arranca")
         while self.running:
             frame_start = time.perf_counter()
             t = time.monotonic()
@@ -908,8 +911,14 @@ class Tray:
             pystray.MenuItem("Salir", lambda _i, _it: app.post("salir")),
         )
         self.icon = CachedTrayIcon("LucesNavidenas", self.images[0], APP_NAME, menu)
-        self.thread = threading.Thread(target=self.icon.run, name="bandeja", daemon=True)
+        trace("bandeja creada")
+        self.thread = threading.Thread(target=self._run, name="bandeja", daemon=True)
         self.thread.start()
+
+    def _run(self):
+        trace("bandeja: hilo arranca")
+        self.icon.run()
+        trace("bandeja: hilo termina")
 
     def sync(self):
         try:
@@ -956,6 +965,7 @@ class Settings:
         self.built = False
 
     def build(self):
+        trace("opciones: construir")
         root = self.root
         root.title(APP_NAME)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -1047,6 +1057,7 @@ class Settings:
         self.apply_btn.pack(side="right", padx=6)
         ttk.Button(foot, text="Cancelar", command=self.on_cancel).pack(side="right")
         self.built = True
+        trace("opciones: construidas")
 
     # ---------- ayudantes de construcción
     def card(self, parent, title):
@@ -1321,6 +1332,7 @@ class Settings:
         if not self.visible():
             return
         w, h, stride, data = frame
+        trace(f"vista previa {w}x{h}")
         img = Image.frombuffer("RGBA", (w, h), data, "raw", "BGRa", stride, 1)
         self.preview_photo = ImageTk.PhotoImage(img)
         self.preview_lbl.configure(image=self.preview_photo, height=h)
