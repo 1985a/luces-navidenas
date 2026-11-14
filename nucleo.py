@@ -529,7 +529,26 @@ class BulbSprites:
         return self._store(key, (surf, ox, oy))
 
 
-SPRITES = BulbSprites()
+_THREAD = threading.local()
+
+
+def thread_sprites():
+    """La caché de sprites del hilo actual.
+
+    Una por hilo a propósito: cairo no permite usar la misma superficie como origen desde dos
+    hilos a la vez (al pintar ajusta el pixman_image de esa superficie). En Linux todo se dibuja
+    en un hilo; en Windows la tira y la vista previa se dibujan en hilos distintos, y compartir
+    la caché tumbaba el programa (0xC0000409) al apagar las luces con las opciones abiertas.
+    """
+    sprites = getattr(_THREAD, "sprites", None)
+    if sprites is None:
+        sprites = _THREAD.sprites = BulbSprites()
+    return sprites
+
+
+def release_thread_sprites():
+    """Libera la caché del hilo actual (p. ej. al cerrar la ventana con la vista previa)."""
+    _THREAD.sprites = None
 
 
 def draw_cable(cr, u, spacing, n):
@@ -782,10 +801,11 @@ class StripEngine:
         # en un píxel entero, que es varias veces más barato que una copia girada.
         cy = metrics(kind, u)[0]
         pivot_y = TOP_MARGIN + 0.45 * u
+        sprites = thread_sprites()
         cr.set_operator(cairo.OPERATOR_ADD)
         for b, level, rgb in items:
             if level > 0:
-                surf, size = SPRITES.glow(kind, u, rgb, level, sf)
+                surf, size = sprites.glow(kind, u, rgb, level, sf)
                 a = self._angle(b, cfg)
                 gx, gy = self._to_surface(b.x - cy * math.sin(a), pivot_y + cy * math.cos(a), cfg, h)
                 x0, y0 = round(gx - size / 2), round(gy - size / 2)
@@ -798,7 +818,7 @@ class StripEngine:
         cr.save()
         self._strip_transform(cr, cfg, h)
         for b, level, rgb in items:
-            surf, ox, oy = SPRITES.body(kind, u, rgb, level, b.dead, sf)
+            surf, ox, oy = sprites.body(kind, u, rgb, level, b.dead, sf)
             cr.save()
             cr.translate(b.x, pivot_y)
             cr.rotate(self._angle(b, cfg))

@@ -1308,6 +1308,7 @@ class Settings:
         if self.preview_job:
             self.root.after_cancel(self.preview_job)
             self.preview_job = None
+        N.release_thread_sprites()  # la caché de la vista previa (hilo de Tk) ya no hace falta
 
     def close_to_background(self):
         """Oculta la ventana; las luces siguen. Avisa cómo volver (salvo que pidan no hacerlo)."""

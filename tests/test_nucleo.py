@@ -143,7 +143,7 @@ class Sprites(unittest.TestCase):
         self.assertEqual(sp.bytes, sum(v[0].get_stride() * v[0].get_height() for v in sp.cache.values()))
 
     def test_resplandor_centrado(self):
-        surf, size = N.SPRITES.glow("c9", 23, (1.0, 0.5, 0.0), 32, 1)
+        surf, size = N.thread_sprites().glow("c9", 23, (1.0, 0.5, 0.0), 32, 1)
         self.assertEqual(surf.get_width(), math.ceil(size))
         data = surf.get_data()
         stride, c = surf.get_stride(), int(size // 2)
@@ -263,6 +263,18 @@ class Motores(unittest.TestCase):
         T = N.EffectEngine.TILE
         rects = sorted(N.EffectEngine.tile_rects({(0, 0), (1, 0), (2, 0), (5, 0), (1, 3)}))
         self.assertEqual(rects, [(0, 0, 3 * T, T), (T, 3 * T, T, T), (5 * T, 0, T, T)])
+
+    def test_cada_hilo_tiene_su_cache_de_sprites(self):
+        import threading
+        mine = N.thread_sprites()
+        self.assertIs(N.thread_sprites(), mine)
+        other = []
+        t = threading.Thread(target=lambda: other.append(N.thread_sprites()))
+        t.start()
+        t.join()
+        self.assertIsNot(other[0], mine)
+        N.release_thread_sprites()
+        self.assertIsNot(N.thread_sprites(), mine)
 
     def test_icono_de_bandeja(self):
         surf = N.render_bulb_icon((1.0, 0.2, 0.2), 1.0, 32)
