@@ -10,6 +10,7 @@ $dir = Join-Path $env:LOCALAPPDATA "Programs\LucesNavidenas"
 $exe = Join-Path $dir "LucesNavidenas.exe"
 $cfgDir = Join-Path $env:APPDATA "LucesNavidenas"
 $log = Join-Path $env:LOCALAPPDATA "LucesNavidenas\registro.txt"
+$crash = Join-Path $env:LOCALAPPDATA "LucesNavidenas\fallos.txt"
 $report = @()
 
 function Captura($nombre) {
@@ -133,7 +134,11 @@ try {
 } finally {
     $report | Set-Content -Encoding UTF8 (Join-Path $out "medidas.txt")
     if (Test-Path $log) { Copy-Item $log (Join-Path $out "registro.txt"); Write-Host "--- registro.txt"; Get-Content $log }
+    if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) {
+        Copy-Item $crash (Join-Path $out "fallos.txt"); Write-Host "--- fallos.txt"; Get-Content $crash
+    }
 }
 if ($fallo) { throw $fallo }
 if (Test-Path $log) { throw "El programa registró errores (ver registro.txt)" }
+if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) { throw "El programa se cayó (ver fallos.txt)" }
 Write-Host "Prueba de humo superada"

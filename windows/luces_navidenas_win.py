@@ -25,6 +25,7 @@ Cómo está hecho (detalle en docs/ARQUITECTURA.md):
 import array
 import copy
 import ctypes
+import faulthandler
 import json
 import os
 import queue
@@ -62,6 +63,7 @@ CONFIG_FILE = os.path.join(APPDATA, "config.json")
 PORT_FILE = os.path.join(APPDATA, "instancia.txt")
 CACHE_DIR = os.path.join(LOCALDATA, "cache")
 LOG_FILE = os.path.join(LOCALDATA, "registro.txt")
+CRASH_FILE = os.path.join(LOCALDATA, "fallos.txt")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "LucesNavidenas"
 MUTEX_NAME = "Local\\LucesNavidenas-instancia"
@@ -101,6 +103,16 @@ def _log_exception(exc_type, exc, tb):
 
 sys.excepthook = _log_exception
 threading.excepthook = lambda a: _log_exception(a.exc_type, a.exc_value, a.exc_traceback)
+
+
+def enable_crash_log():
+    """Si el proceso cae en código nativo (ctypes, Tk, cairo), deja la traza de cada hilo en fallos.txt."""
+    try:
+        os.makedirs(LOCALDATA, exist_ok=True)
+        enable_crash_log.file = open(CRASH_FILE, "a", encoding="utf-8")  # noqa: SIM115 (abierto toda la vida)
+        faulthandler.enable(file=enable_crash_log.file, all_threads=True)
+    except OSError:
+        pass
 
 
 def load_config():
@@ -1701,6 +1713,7 @@ def main():
         return 0
     if "--salir" in args:
         return 0  # no había nada que cerrar
+    enable_crash_log()
     set_dpi_awareness()
     app = App()
     app.run(args)
