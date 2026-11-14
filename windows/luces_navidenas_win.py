@@ -97,6 +97,14 @@ def log(msg):
         pass
 
 
+TRACE = bool(os.environ.get("LUCES_TRAZA"))  # traza detallada para diagnosticar (la usa la prueba de humo)
+
+
+def trace(msg):
+    if TRACE:
+        log("[traza] " + msg)
+
+
 def _log_exception(exc_type, exc, tb):
     log("".join(traceback.format_exception(exc_type, exc, tb)))
 
@@ -1530,6 +1538,7 @@ class App:
                 msg = self.queue.get_nowait()
             except queue.Empty:
                 return
+            trace(f"orden {msg}")
             if msg[0] == "opciones":
                 self.settings.open()
             elif msg[0] == "alternar":
@@ -1611,9 +1620,12 @@ class App:
         if any(old[k] != new[k] for k in ("mode", "rate", "power", "sound", "tray_leds")):
             self.schedule_blink()
         if old["power"] != new["power"]:
+            trace("tray.sync")
             self.tray.sync()
+            trace("tray.sync hecho")
         self.renderer.poke(force=True)
         self.settings.wake_preview(force=True)
+        trace("apply hecho")
         if save:
             self.save()
 
@@ -1624,6 +1636,7 @@ class App:
 
     def set_power(self, on):
         """El interruptor se aplica y se guarda al momento (sin tocar otros cambios pendientes)."""
+        trace(f"set_power {on}")
         if on == self.cfg["power"]:
             return
         new = copy.deepcopy(self.cfg)
@@ -1685,6 +1698,7 @@ class App:
         self.root.mainloop()
 
     def quit_app(self):
+        trace("quit_app desde:\n" + "".join(traceback.format_stack(limit=8)))
         if self.quitting:
             return
         self.quitting = True
@@ -1716,7 +1730,9 @@ def main():
     enable_crash_log()
     set_dpi_awareness()
     app = App()
+    trace(f"arranque {args}")
     app.run(args)
+    trace("el bucle de Tk terminó")
     app.tray.thread.join(timeout=1.5)
     return 0
 

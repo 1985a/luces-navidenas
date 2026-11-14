@@ -19,14 +19,21 @@ function Captura($nombre) {
     if ($LASTEXITCODE -ne 0) { Write-Host "No se pudo capturar $nombre" }
 }
 
-function Proceso() { Get-Process LucesNavidenas -ErrorAction SilentlyContinue | Select-Object -First 1 }
+$env:LUCES_TRAZA = "1"
+$script:principal = $null   # la copia principal (las demás solo pasan órdenes y se cierran)
+
+function Proceso() {
+    if ($script:principal -and -not $script:principal.HasExited) { return $script:principal }
+    return $null
+}
 
 function MedirCpu($segundos, $etiqueta) {
     $p = Proceso
-    if (-not $p) { throw "El programa no está corriendo ($etiqueta)" }
+    if (-not $p) { throw "El programa no está corriendo ($etiqueta; código de salida $(Codigo))" }
     $c0 = $p.TotalProcessorTime.TotalSeconds; $t0 = Get-Date
     Start-Sleep -Seconds $segundos
     $p.Refresh()
+    if ($p.HasExited) { throw "El programa se cerró durante la medida ($etiqueta; código de salida $(Codigo))" }
     $c1 = $p.TotalProcessorTime.TotalSeconds; $t1 = Get-Date
     $pct = 100 * ($c1 - $c0) / ($t1 - $t0).TotalSeconds
     $mem = [math]::Round($p.WorkingSet64 / 1MB)
@@ -45,9 +52,14 @@ function Config($cambios) {
 }
 
 function Arrancar($argumentos) {
-    Start-Process $exe -ArgumentList $argumentos
+    $script:principal = Start-Process $exe -ArgumentList $argumentos -PassThru
     Start-Sleep -Seconds 6
-    if (-not (Proceso)) { throw "No arrancó con: $argumentos" }
+    if (-not (Proceso)) { throw "No arrancó con: $argumentos (código de salida $(Codigo))" }
+}
+
+function Codigo() {
+    if ($script:principal -and $script:principal.HasExited) { return "0x{0:X8}" -f $script:principal.ExitCode }
+    return "sigue corriendo"
 }
 
 # Orden a la copia que ya corre: la segunda copia debe pasarla y terminar enseguida
@@ -58,7 +70,7 @@ function Orden($argumento) {
 
 function Viva($despues) {
     Start-Sleep -Seconds 2
-    if (-not (Proceso)) { throw "El programa se cerró después de: $despues" }
+    if (-not (Proceso)) { throw "El programa se cerró después de: $despues (código de salida $(Codigo))" }
 }
 
 function Salir() {
@@ -113,9 +125,10 @@ try {
 
     Write-Host "== Una sola copia: dos arranques a la vez"
     Config @{}
-    Start-Process $exe -ArgumentList "--oculto"; Start-Process $exe -ArgumentList "--oculto"
+    $a = Start-Process $exe -ArgumentList "--oculto" -PassThru; $b = Start-Process $exe -ArgumentList "--oculto" -PassThru
     Start-Sleep -Seconds 8
     $n = @(Get-Process LucesNavidenas -ErrorAction SilentlyContinue).Count
+    $script:principal = @($a, $b) | Where-Object { -not $_.HasExited } | Select-Object -First 1
     $report += "Copias tras dos arranques simultáneos: $n"
     if ($n -ne 1) { throw "Hay $n copias del programa (debería haber 1)" }
     Salir
@@ -139,6 +152,6 @@ try {
     }
 }
 if ($fallo) { throw $fallo }
-if (Test-Path $log) { throw "El programa registró errores (ver registro.txt)" }
+if ((Test-Path $log) -and (Select-String -Path $log -Pattern "^\S+ \S+ (?!\[traza\])" -Quiet)) { throw "El programa registró errores (ver registro.txt)" }
 if ((Test-Path $crash) -and (Get-Item $crash).Length -gt 0) { throw "El programa se cayó (ver fallos.txt)" }
 Write-Host "Prueba de humo superada"
