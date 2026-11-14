@@ -1,5 +1,23 @@
 # Cambios
 
+## 1.6 para Windows — 2026-11-14
+
+Primera versión de Windows con las mejoras de la 1.6 (la anterior era la 1.4.2).
+
+- Mismo dibujo que Linux: el núcleo (`nucleo.py`) es compartido.
+- Hilo de dibujo que duerme hasta el próximo cambio (la 1.4.2 despertaba 30 veces por segundo
+  aunque nada cambiara) y repinta solo lo que cambia. Medido en Windows Server 2022 (máquina
+  virtual de GitHub Actions, 1024×768): 0,1 % de CPU con «Alternando + balanceo», 0,0 % con
+  las luces fijas, 0,4 % con nieve.
+- Sin `timeBeginPeriod(1)` global (subía el consumo de todo el sistema).
+- Una sola copia aunque se abra dos veces a la vez (mutex); las órdenes entre copias llevan contraseña.
+- «Fluidez» (60/30 fps) también en Windows, automática con batería o ahorro de batería.
+- Configuración validada, registro de errores (`registro.txt`) y de caídas (`fallos.txt`).
+- Opciones en dos columnas en pantallas estrechas; el botón de encendido ya no muestra un cuadrado.
+- Instalador por usuario (sin administrador) que reemplaza a la 1.4.2 conservando los ajustes;
+  el arranque con Windows es opcional y viene desmarcado.
+- Compilado y probado en un Windows real por GitHub Actions: instala, usa, mide y desinstala.
+
 ## 1.6 — 2026-11-11 · pase de buenas prácticas
 
 Mismo aspecto (comparado píxel a píxel con la 1.5: diferencia máxima 6/255), mucho menos consumo.

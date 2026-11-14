@@ -27,9 +27,9 @@ Lo que se ve es idéntico en los dos sistemas porque lo dibuja el mismo código 
 | `LayeredWindow` | Ventana transparente por píxel, siempre encima, que deja pasar los clics. Su mapa de bits (DIB) es la memoria de una superficie de cairo: se dibuja y se presenta sin copias intermedias |
 | `StripWindow` | Una tira por monitor; si «No tapar las ventanas» está activo, se registra como barra (AppBar) |
 | `EffectWindow` | Nieve sobre un monitor; repinta solo los bloques que cambian |
-| `Renderer` | Hilo de dibujo. Con nieve, al ritmo de la pantalla (`DwmFlush`) con el tope de fps; sin nieve, duerme hasta el próximo cambio que pidan las tiras o hasta que una opción lo despierte |
-| `MessageWindow` | Ventana invisible del hilo de Tk. Bandeja, otra copia del programa (`CommandServer`) y MCI la despiertan con `PostMessage`: nada sondea |
-| `WinMusic` | Lista en bucle con MCI; el fin de cada canción llega como `MM_MCINOTIFY` |
+| `Renderer` | El único hilo que usa cairo: tiras, nieve y también la vista previa de las opciones (le pasa a Tk los píxeles ya listos). Con nieve, al ritmo de la pantalla (`DwmFlush`) con el tope de fps; sin nieve, duerme hasta el próximo cambio que pidan las tiras o hasta que una opción lo despierte |
+| `Messenger` | Hilo que duerme en una cola y despierta a Tk con `event_generate` (el aviso entre hilos que admite tkinter). Lo usan la bandeja, otra copia del programa (`CommandServer`) y el procedimiento de ventana |
+| `WinMusic` | Lista en bucle con MCI; mientras suena, mira una vez por segundo si terminó la canción |
 | `CommandServer` + mutex | Una sola copia: la segunda le pasa sus argumentos a la primera por un socket local con contraseña |
 | `Settings` | Ventana de opciones (Tkinter + sv_ttk); la vista previa solo se anima mientras se ve |
 
@@ -49,7 +49,22 @@ Windows:
   música MCI y latido de la bandeja.
 - **Dibujo** (`Renderer`): pinta y presenta las ventanas por capas. Comparte con Tk las listas de
   ventanas bajo `lock`; Tk solo destruye una ventana después de sacarla de la lista.
-- **Bandeja** (pystray) y **órdenes** (`CommandServer`): solo encolan y avisan con `PostMessage`.
+- **Bandeja** (pystray), **órdenes** (`CommandServer`) y **mensajero**: solo encolan; el mensajero
+  despierta a Tk.
+
+Dos reglas de Windows, aprendidas a base de caídas en un Windows real (ver el historial de git):
+
+1. **Nada de tkinter dentro de un procedimiento de ventana** (`_wndproc`). Corre dentro del
+   despacho de mensajes de Tcl, y una llamada a tkinter desde ahí deja en NULL el estado de Python
+   que `_tkinter` guarda para `mainloop`: la siguiente vez que Tcl llama a Python, el proceso cae
+   (0xC0000005 / 0xC0000409, sin traza). Ahí solo se hace Win32 o se encola con `app.post()`.
+2. **cairo en un solo hilo.** El cairo de las ruedas de pycairo para Windows no admite dibujar
+   desde dos hilos a la vez. Todo lo que pinta lo hace el `Renderer`; lo poco que se pinta en
+   otro hilo (muestras de color, iconos de la bandeja) se hace antes de que arranque, y las
+   ventanas por capas se crean y destruyen con su candado tomado.
+
+Para diagnosticar en Windows: `LUCES_TRAZA=1` escribe una traza en `registro.txt` (órdenes,
+cuadros por segundo…) y `fallos.txt` recoge los errores fatales y las caídas nativas.
 - **Sonidos**: igual que en Linux.
 
 ## Cuándo se redibuja (la regla que manda en el consumo)
