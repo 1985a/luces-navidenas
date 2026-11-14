@@ -114,10 +114,18 @@ threading.excepthook = lambda a: _log_exception(a.exc_type, a.exc_value, a.exc_t
 
 
 def enable_crash_log():
-    """Si el proceso cae en código nativo (ctypes, Tk, cairo), deja la traza de cada hilo en fallos.txt."""
+    """Lo que el proceso no puede registrar por sí mismo va a fallos.txt.
+
+    Sin consola no existe el descriptor 2: los errores fatales de Python (Py_FatalError), los
+    pánicos de Tcl y las caídas en código nativo escribirían ahí y se perderían. Se le apunta un
+    archivo, y faulthandler deja además la traza de cada hilo si el proceso cae.
+    """
     try:
         os.makedirs(LOCALDATA, exist_ok=True)
-        enable_crash_log.file = open(CRASH_FILE, "a", encoding="utf-8")  # noqa: SIM115 (abierto toda la vida)
+        fd = os.open(CRASH_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        os.dup2(fd, 2)
+        os.close(fd)
+        enable_crash_log.file = os.fdopen(2, "w", encoding="utf-8", closefd=False)
         faulthandler.enable(file=enable_crash_log.file, all_threads=True)
     except OSError:
         pass
