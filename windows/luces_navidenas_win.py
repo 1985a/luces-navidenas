@@ -172,6 +172,7 @@ ULW_ALPHA = 2
 WM_USER, WM_APP = 0x400, 0x8000
 WM_APPBAR = WM_USER + 257
 WM_COMMANDS = WM_APP + 1         # hay órdenes en la cola de la aplicación
+WM_PREVIEW = WM_APP + 2          # el hilo de dibujo dejó lista una imagen de la vista previa
 MM_MCINOTIFY = 0x3B9             # MCI: aviso de reproducción
 MCI_NOTIFY_SUCCESSFUL = 1        # … la canción terminó sola (no la detuvimos nosotros)
 WM_DISPLAYCHANGE = 0x7E
@@ -321,6 +322,9 @@ def _wndproc(hwnd, msg, wparam, lparam):
         app = _app_ref[0]
         if msg == WM_COMMANDS and app is not None:
             app.drain_commands()
+            return 0
+        if msg == WM_PREVIEW and app is not None:
+            app.show_preview()
             return 0
         if msg == MM_MCINOTIFY and app is not None:
             if wparam == MCI_NOTIFY_SUCCESSFUL:  # los avisos de «abortada» llegan al cambiar de canción
@@ -564,24 +568,36 @@ class EffectWindow(LayeredWindow):
 
 
 class Renderer:
-    """Dibuja las tiras y los efectos en un hilo propio.
+    """El único hilo que dibuja con cairo: tiras, efectos y la vista previa de las opciones.
+
+    Uno solo a propósito: el cairo que trae pycairo en Windows no admite dibujar desde dos hilos
+    a la vez (al apagar las luces con las opciones abiertas, tira y vista previa creaban sprites
+    en paralelo y el proceso abortaba con 0xC0000409). Tk solo recibe los píxeles ya listos.
 
     Con nieve, va al ritmo de la pantalla (DwmFlush) con el tope de fps de la «Fluidez».
     Sin nieve, duerme hasta el próximo cambio que pida alguna tira (parpadeo, balanceo,
     color) o hasta que la aplicación lo despierte (poke) porque cambió una opción.
+
+    Las ventanas por capas se crean y destruyen en el hilo de Tk, siempre con `lock` tomado
+    (sus superficies son de cairo). Con el candado tomado este hilo no manda mensajes a
+    ventanas de Tk (nada de SetWindowPos), para no esperar a un hilo que espera el candado.
     """
 
-    SHORT_WAIT = 0.05  # s: por debajo, se duerme con time.sleep (preciso) en vez de esperar avisos
+    SHORT_WAIT = 0.05      # s: por debajo, se duerme con time.sleep (preciso) en vez de esperar avisos
+    PREVIEW_PERIOD = 1 / 30  # la vista previa no necesita más de 30 fps
 
     def __init__(self, app):
         self.app = app
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.wake = threading.Event()
         self.strips = []
         self.effects = []
         self.force = False
-        self.raise_strips = False
         self.last_fx = None
+        self.preview_engine = N.StripEngine(preview=True)
+        self.preview_width = None   # None: la ventana de opciones está oculta
+        self.preview_size = None
+        self.preview_next = 0.0
         self.running = True
         self.thread = threading.Thread(target=self._loop, name="dibujo", daemon=True)
         self.thread.start()
@@ -595,10 +611,18 @@ class Renderer:
     def set_effects(self, effects):
         with self.lock:
             old, self.effects = self.effects, effects
-            self.raise_strips = bool(effects)
             self.last_fx = None
         self.poke()
         return old
+
+    def set_preview(self, width):
+        """Ancho de la vista previa en px, o None si la ventana de opciones no se ve."""
+        with self.lock:
+            if width != self.preview_width:
+                self.preview_width = width
+                self.preview_engine.force = True
+                self.preview_next = 0.0
+        self.poke()
 
     def poke(self, force=False):
         """Despierta al hilo (cambió una opción); force: repintar todo."""
@@ -617,6 +641,26 @@ class Renderer:
         if left > 0.002:
             time.sleep(left - 0.001)
 
+    def _preview(self, t):
+        """Dibuja la vista previa si cambió y se la pasa a Tk. Devuelve los segundos hasta la próxima."""
+        w, cfg = self.preview_width, self.app.cfg
+        h = N.strip_height(cfg) + 26
+        f = self.preview_engine.tick(t, cfg, w)
+        if f.redraw or (w, h) != self.preview_size:
+            self.preview_size = (w, h)
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+            cr = cairo.Context(surf)
+            self.preview_engine.draw(cr, w, h, cfg)
+            # sobre el fondo de la ventana (Tk no mezcla el alfa de la imagen)
+            cr.set_operator(cairo.OPERATOR_DEST_OVER)
+            cr.set_source_rgb(0.11, 0.11, 0.11)
+            cr.paint()
+            del cr
+            surf.flush()
+            self.app.deliver_preview(w, h, surf.get_stride(), bytes(surf.get_data()))
+            surf.finish()
+        return self.PREVIEW_PERIOD if f.busy else max(self.PREVIEW_PERIOD, f.wait)
+
     def _loop(self):
         while self.running:
             frame_start = time.perf_counter()
@@ -625,6 +669,8 @@ class Renderer:
             with self.lock:
                 if self.force:
                     self.force = False
+                    self.preview_engine.force = True
+                    self.preview_next = 0.0
                     for s in self.strips:
                         s.engine.force = True
                         s.next_at = 0.0
@@ -634,10 +680,6 @@ class Renderer:
                     self.last_fx = t
                     for w in effects:
                         w.frame(t, dt)
-                if effects and self.raise_strips:  # las luces por encima de la nieve
-                    self.raise_strips = False
-                    for s in self.strips:
-                        s.raise_top()
                 next_wait = 1.0
                 for s in self.strips:
                     if t >= s.next_at:
@@ -647,6 +689,10 @@ class Renderer:
                         else:  # tope de fps: esperar a que toque el cuadro
                             s.next_at = s.engine.last_t + 1.0 / fps - 0.003
                     next_wait = min(next_wait, s.next_at - t)
+                if self.preview_width:
+                    if t >= self.preview_next:
+                        self.preview_next = t + self._preview(t)
+                    next_wait = min(next_wait, self.preview_next - t)
             if effects:
                 self._wait_vsync(frame_start)
             elif next_wait >= self.SHORT_WAIT:
@@ -902,10 +948,10 @@ class Settings:
         self.updating = False
         self.refreshers = []
         self.snapshot = copy.deepcopy(app.cfg)
-        self.preview_engine = N.StripEngine(preview=True)
         self.preview_photo = None
-        self.preview_job = None
         self.songs_key = None
+        # muestras de color pintadas ahora, antes de que arranque el hilo de dibujo (cairo, un solo hilo)
+        self.swatch_images = {key: self._swatch_image(key) for key, _n, _c in N.PALETTES}
         self.swatches = {}
         self.built = False
 
@@ -947,6 +993,7 @@ class Settings:
 
         self.preview_lbl = tk.Label(outer, bg="#1c1c1c", bd=0, highlightthickness=0)
         self.preview_lbl.pack(fill="x", pady=(10, 6))
+        self.preview_lbl.bind("<Configure>", lambda _e: self._preview_on())
 
         foot = ttk.Frame(outer, padding=(0, 8, 0, 0))
         foot.pack(side="bottom", fill="x")
@@ -1114,15 +1161,17 @@ class Settings:
             g.columnconfigure(c, weight=1, uniform="chip")
         var = tk.StringVar()
         for n, (key, name, _cols) in enumerate(N.PALETTES):
-            rb = ttk.Radiobutton(g, text=name, image=self.swatch(key), compound="top", value=key, variable=var,
+            rb = ttk.Radiobutton(g, text=name, image=self.swatch_photo(key), compound="top", value=key, variable=var,
                                  style="Toggle.TButton", command=lambda: self.set("palette", var.get()))
             rb.grid(row=n // 3, column=n % 3, sticky="ew", padx=3, pady=3)
         self.refreshers.append(lambda c: var.set(c["palette"]))
 
-    def swatch(self, key):
+    @staticmethod
+    def _swatch_image(key):
+        """Cinco bolitas con los colores de la paleta (imagen PIL)."""
         w, h = 66, 16
-        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
-        cr = cairo.Context(s)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(surf)
         cols = N.PALETTE_MAP[key][1]
         for i in range(5):
             rgb = cols[i % len(cols)] if cols else N.hsv(i / 5, 0.85, 1.0)
@@ -1133,8 +1182,12 @@ class Settings:
             cr.set_source(g)
             cr.arc(x, h / 2, 5, 0, 6.3)
             cr.fill()
-        s.flush()
-        photo = ImageTk.PhotoImage(surface_to_pil(s))
+        del cr
+        surf.flush()
+        return surface_to_pil(surf)
+
+    def swatch_photo(self, key):
+        photo = ImageTk.PhotoImage(self.swatch_images[key])
         self.swatches[key] = photo  # Tk no guarda la referencia: sin esto la imagen desaparece
         return photo
 
@@ -1256,41 +1309,21 @@ class Settings:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
-        self.wake_preview(force=True)
+        self._preview_on()
 
-    # ---------- vista previa (solo mientras la ventana está abierta)
-    def wake_preview(self, force=False):
-        if force:
-            self.preview_engine.force = True
-        if self.preview_job:
-            self.root.after_cancel(self.preview_job)
-            self.preview_job = None
+    # ---------- vista previa (la dibuja el hilo de dibujo, solo mientras la ventana se ve)
+    def _preview_on(self):
         if self.visible():
-            self.preview_job = self.root.after(0, self._preview_frame)
+            self.app.renderer.set_preview(max(200, self.preview_lbl.winfo_width()))
 
-    def _preview_frame(self):
-        self.preview_job = None
+    def show_preview(self, frame):
+        """Muestra la imagen que dejó lista el hilo de dibujo (aquí no se usa cairo)."""
         if not self.visible():
-            return  # oculta: no se anima (se vuelve a encender al abrir)
-        w = max(200, self.preview_lbl.winfo_width())
-        cfg = self.app.cfg
-        h = N.strip_height(cfg) + 26
-        size_changed = self.preview_photo is None or (self.preview_photo.width(), self.preview_photo.height()) != (w, h)
-        f = self.preview_engine.tick(time.monotonic(), cfg, w)
-        if f.redraw or size_changed:
-            s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
-            cr = cairo.Context(s)
-            self.preview_engine.draw(cr, w, h, cfg)
-            # sobre el fondo de la ventana (Tk no mezcla el alfa de la imagen)
-            cr.set_operator(cairo.OPERATOR_DEST_OVER)
-            cr.set_source_rgb(0.11, 0.11, 0.11)
-            cr.paint()
-            del cr
-            s.flush()
-            self.preview_photo = ImageTk.PhotoImage(surface_to_pil(s))
-            self.preview_lbl.configure(image=self.preview_photo, height=h)
-        delay = 1.0 / 30 if f.busy else max(1.0 / 30, f.wait)  # la vista previa no necesita más de 30 fps
-        self.preview_job = self.root.after(int(delay * 1000), self._preview_frame)
+            return
+        w, h, stride, data = frame
+        img = Image.frombuffer("RGBA", (w, h), data, "raw", "BGRa", stride, 1)
+        self.preview_photo = ImageTk.PhotoImage(img)
+        self.preview_lbl.configure(image=self.preview_photo, height=h)
 
     # ---------- botones
     def on_apply(self):
@@ -1313,10 +1346,7 @@ class Settings:
 
     def _hide(self):
         self.root.withdraw()
-        if self.preview_job:
-            self.root.after_cancel(self.preview_job)
-            self.preview_job = None
-        N.release_thread_sprites()  # la caché de la vista previa (hilo de Tk) ya no hace falta
+        self.app.renderer.set_preview(None)
 
     def close_to_background(self):
         """Oculta la ventana; las luces siguen. Avisa cómo volver (salvo que pidan no hacerlo)."""
@@ -1522,10 +1552,14 @@ class App:
         self.music.volume = self.cfg["volume"]
         self.sfx = WinSfx()
         self.sfx.volume = self.cfg["fx_volume"]
+        self.preview_lock = threading.Lock()
+        self.preview_frame = None    # última imagen de la vista previa, esperando a Tk
+        self.preview_posted = False
+        # Lo que dibuja con cairo fuera del hilo de dibujo va antes de que este arranque
         self.settings = Settings(self, self.root)
+        self.tray = Tray(self)
         self.server = CommandServer(self)
         self.renderer = Renderer(self)
-        self.tray = Tray(self)
         self.build_strips()
         self.update_effect()
         self.update_music()
@@ -1565,10 +1599,11 @@ class App:
         return mons
 
     def build_strips(self):
-        for w in self.renderer.set_strips([]):
-            w.destroy()
-        self.strips = [StripWindow(self, m) for m in self.monitors()]
-        self.renderer.set_strips(list(self.strips))
+        with self.renderer.lock:  # sus superficies son de cairo: nada se dibuja mientras tanto
+            for w in self.renderer.set_strips([]):
+                w.destroy()
+            self.strips = [StripWindow(self, m) for m in self.monitors()]
+            self.renderer.set_strips(list(self.strips))
 
     def schedule_rebuild(self):
         if self.rebuild_job:
@@ -1582,13 +1617,16 @@ class App:
 
     def update_effect(self, rebuild=False):
         want = (self.cfg["power"] and self.cfg["effect_on"]) or time.monotonic() < self.test_until
-        if rebuild or not want:
-            for w in self.renderer.set_effects([]):
-                w.destroy()
-            self.effects = []
-        if want and not self.effects:
-            self.effects = [EffectWindow(self, m) for m in self.monitors()]
-            self.renderer.set_effects(list(self.effects))
+        with self.renderer.lock:  # sus superficies son de cairo: nada se dibuja mientras tanto
+            if rebuild or not want:
+                for w in self.renderer.set_effects([]):
+                    w.destroy()
+                self.effects = []
+            if want and not self.effects:
+                self.effects = [EffectWindow(self, m) for m in self.monitors()]
+                self.renderer.set_effects(list(self.effects))
+                for s in self.strips:  # las luces por encima de la nieve
+                    s.raise_top()
 
     def test_effect(self):
         self.test_until = time.monotonic() + 10
@@ -1599,6 +1637,21 @@ class App:
         skip = set(self.cfg.get("music_skip", []))
         self.music.set_tracks([p for p, _ in list_songs(self.cfg["music_dir"]) if p not in skip])
         self.music.set_enabled(self.cfg["music"] and self.cfg["power"])
+
+    def deliver_preview(self, w, h, stride, data):
+        """Desde el hilo de dibujo: guarda la última imagen y avisa a Tk (un aviso a la vez)."""
+        with self.preview_lock:
+            self.preview_frame = (w, h, stride, data)
+            if self.preview_posted:
+                return  # Tk aún no tomó la anterior: se la reemplaza, sin acumular avisos
+            self.preview_posted = True
+        self.msgwin.post(WM_PREVIEW)
+
+    def show_preview(self):
+        with self.preview_lock:
+            frame, self.preview_frame, self.preview_posted = self.preview_frame, None, False
+        if frame and not self.quitting:
+            self.settings.show_preview(frame)
 
     def effect_fps(self):
         f = self.cfg.get("fluidez", "auto")
@@ -1633,7 +1686,6 @@ class App:
             self.tray.sync()
             trace("tray.sync hecho")
         self.renderer.poke(force=True)
-        self.settings.wake_preview(force=True)
         trace("apply hecho")
         if save:
             self.save()
@@ -1713,8 +1765,9 @@ class App:
         self.quitting = True
         self.music.close()
         self.renderer.stop()
-        for w in self.renderer.set_effects([]) + self.renderer.set_strips([]):
-            w.destroy()
+        with self.renderer.lock:
+            for w in self.renderer.set_effects([]) + self.renderer.set_strips([]):
+                w.destroy()
         self.strips, self.effects = [], []
         self.tray.stop()
         self.server.close()
