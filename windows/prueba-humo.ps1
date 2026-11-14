@@ -49,74 +49,91 @@ function Arrancar($argumentos) {
     if (-not (Proceso)) { throw "No arrancó con: $argumentos" }
 }
 
+# Orden a la copia que ya corre: la segunda copia debe pasarla y terminar enseguida
+function Orden($argumento) {
+    $p = Start-Process $exe -ArgumentList $argumento -PassThru
+    if (-not $p.WaitForExit(15000)) { $p.Kill(); throw "La orden $argumento no terminó (¿no había copia abierta?)" }
+}
+
+function Viva($despues) {
+    Start-Sleep -Seconds 2
+    if (-not (Proceso)) { throw "El programa se cerró después de: $despues" }
+}
+
 function Salir() {
-    Start-Process $exe -ArgumentList "--salir" -Wait
+    Orden "--salir"
     for ($i = 0; $i -lt 40 -and (Proceso); $i++) { Start-Sleep -Milliseconds 250 }
     if (Proceso) { throw "No se cerró con --salir" }
 }
 
-Write-Host "== Instalar $($installer.Name)"
-Start-Process $installer.FullName -ArgumentList "/S" -Wait
-if (-not (Test-Path $exe)) { throw "No se instaló en $dir" }
+$fallo = $null
+try {
+    Write-Host "== Instalar $($installer.Name)"
+    Start-Process $installer.FullName -ArgumentList "/S" -Wait
+    if (-not (Test-Path $exe)) { throw "No se instaló en $dir" }
 
-Config @{}
-Arrancar "--oculto"
-Captura "1-luces-usuario"
-MedirCpu 20 "Alternando, retro, balanceo (como en Linux)"
+    Config @{}
+    Arrancar "--oculto"
+    Captura "1-luces-usuario"
+    MedirCpu 20 "Alternando, retro, balanceo (como en Linux)"
 
-Start-Process $exe -ArgumentList "--opciones" -Wait
-Start-Sleep -Seconds 4
-Captura "2-opciones"
-MedirCpu 10 "Con la ventana de opciones abierta"
+    Orden "--opciones"; Viva "--opciones"
+    Start-Sleep -Seconds 2
+    Captura "2-opciones"
+    MedirCpu 10 "Con la ventana de opciones abierta"
 
-Start-Process $exe -ArgumentList "--alternar" -Wait
-Start-Sleep -Seconds 2
-MedirCpu 10 "Luces apagadas"
-Start-Process $exe -ArgumentList "--alternar" -Wait
-Salir
+    Orden "--alternar"; Viva "--alternar (apagar)"
+    MedirCpu 10 "Luces apagadas"
+    Orden "--alternar"; Viva "--alternar (encender)"
+    Salir
 
-Config @{ sway = $false }
-Arrancar "--oculto"
-MedirCpu 20 "Alternando, sin balanceo"
-Salir
+    Config @{ sway = $false }
+    Arrancar "--oculto"
+    MedirCpu 20 "Alternando, sin balanceo"
+    Salir
 
-Config @{ sway = $false; mode = "none" }
-Arrancar "--oculto"
-MedirCpu 20 "Encendidas fijas (debería dormir)"
-Salir
+    Config @{ sway = $false; mode = "none" }
+    Arrancar "--oculto"
+    MedirCpu 20 "Encendidas fijas (debería dormir)"
+    Salir
 
-Config @{ sway = $false; palette = "arcoiris" }
-Arrancar "--oculto"
-Captura "3-arcoiris"
-MedirCpu 20 "Arcoíris"
-Salir
+    Config @{ sway = $false; palette = "arcoiris" }
+    Arrancar "--oculto"
+    Captura "3-arcoiris"
+    MedirCpu 20 "Arcoíris"
+    Salir
 
-Config @{ sway = $false; mode = "none"; effect_on = $true; position = "bottom"; bulb = "estrella"; palette = "navidad" }
-Arrancar "--oculto"
-Start-Sleep -Seconds 3
-Captura "4-nieve-abajo"
-MedirCpu 20 "Nieve, luces abajo"
-Salir
+    Config @{ sway = $false; mode = "none"; effect_on = $true; position = "bottom"; bulb = "estrella"; palette = "navidad" }
+    Arrancar "--oculto"
+    Start-Sleep -Seconds 3
+    Captura "4-nieve-abajo"
+    MedirCpu 20 "Nieve, luces abajo"
+    Salir
 
-Write-Host "== Una sola copia: dos arranques a la vez"
-Config @{}
-Start-Process $exe -ArgumentList "--oculto"; Start-Process $exe -ArgumentList "--oculto"
-Start-Sleep -Seconds 8
-$n = @(Get-Process LucesNavidenas -ErrorAction SilentlyContinue).Count
-$report += "Copias tras dos arranques simultáneos: $n"
-if ($n -ne 1) { throw "Hay $n copias del programa (debería haber 1)" }
-Salir
+    Write-Host "== Una sola copia: dos arranques a la vez"
+    Config @{}
+    Start-Process $exe -ArgumentList "--oculto"; Start-Process $exe -ArgumentList "--oculto"
+    Start-Sleep -Seconds 8
+    $n = @(Get-Process LucesNavidenas -ErrorAction SilentlyContinue).Count
+    $report += "Copias tras dos arranques simultáneos: $n"
+    if ($n -ne 1) { throw "Hay $n copias del programa (debería haber 1)" }
+    Salir
 
-Write-Host "== Desinstalar"
-Start-Process (Join-Path $dir "Desinstalar.exe") -ArgumentList "/S", "_?=$dir" -Wait
-Remove-Item -Force (Join-Path $dir "Desinstalar.exe") -ErrorAction SilentlyContinue
-$restos = @(Get-ChildItem $dir -Recurse -ErrorAction SilentlyContinue).Count
-$report += "Archivos que quedan tras desinstalar: $restos"
-
-$report | Set-Content -Encoding UTF8 (Join-Path $out "medidas.txt")
-if (Test-Path $log) {
-    Copy-Item $log (Join-Path $out "registro.txt")
-    Get-Content $log
-    throw "El programa registró errores (ver registro.txt)"
+    Write-Host "== Desinstalar"
+    Start-Process (Join-Path $dir "Desinstalar.exe") -ArgumentList "/S", "_?=$dir" -Wait
+    Remove-Item -Force (Join-Path $dir "Desinstalar.exe") -ErrorAction SilentlyContinue
+    $restos = @(Get-ChildItem $dir -Recurse -ErrorAction SilentlyContinue).Count
+    $report += "Archivos que quedan tras desinstalar: $restos"
+} catch {
+    $fallo = $_
+    Write-Host "FALLO: $fallo"
+    $report += "FALLO: $fallo"
+    Captura "fallo"
+    Get-Process LucesNavidenas -ErrorAction SilentlyContinue | Stop-Process -Force
+} finally {
+    $report | Set-Content -Encoding UTF8 (Join-Path $out "medidas.txt")
+    if (Test-Path $log) { Copy-Item $log (Join-Path $out "registro.txt"); Write-Host "--- registro.txt"; Get-Content $log }
 }
+if ($fallo) { throw $fallo }
+if (Test-Path $log) { throw "El programa registró errores (ver registro.txt)" }
 Write-Host "Prueba de humo superada"

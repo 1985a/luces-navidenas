@@ -946,19 +946,21 @@ class Settings:
                 canvas.yview_scroll(int(-e.delta / 120), "units")
         root.bind_all("<MouseWheel>", wheel)
 
-        for c in range(3):
+        # tres columnas en pantallas anchas; en las de 1024-1280 px no caben y se cortaban
+        ncols = 3 if W >= 1060 else 2
+        for c in range(ncols):
             grid.columnconfigure(c, weight=1, uniform="col")
-        cols = [ttk.Frame(grid) for _ in range(3)]
+        cols = [ttk.Frame(grid) for _ in range(ncols)]
         for i, f in enumerate(cols):
             f.grid(row=0, column=i, sticky="nsew", padx=6)
-        self.card_modes(cols[0])
-        self.card_speed(cols[0])
-        self.card_misc(cols[0])
-        self.card_bulbs(cols[1])
-        self.card_colors(cols[1])
-        self.card_music(cols[2])
-        self.card_effect(cols[2])
-        self.card_place(cols[2])
+        layout = ([self.card_modes, self.card_speed, self.card_misc], [self.card_bulbs, self.card_colors],
+                  [self.card_music, self.card_effect, self.card_place])
+        if ncols == 2:
+            layout = ([self.card_modes, self.card_speed, self.card_bulbs, self.card_misc],
+                      [self.card_colors, self.card_music, self.card_effect, self.card_place])
+        for col, cards in zip(cols, layout, strict=True):
+            for make in cards:
+                make(col)
         for f in cols:
             f.grid_configure(sticky="new")
 
@@ -1203,7 +1205,8 @@ class Settings:
             self.apply_btn.state(["!disabled"] if self.app.cfg != self.app.saved_cfg else ["disabled"])
 
     def _power_label(self):
-        self.power_btn.configure(text="⏻  Encendidas" if self.power_var.get() else "⏻  Apagadas")
+        # ● y ○ existen en Segoe UI de todos los Windows (⏻ no: salía un cuadrado en Windows 10/Server)
+        self.power_btn.configure(text="●  Encendidas" if self.power_var.get() else "○  Apagadas")
 
     def on_power(self):
         self._power_label()
