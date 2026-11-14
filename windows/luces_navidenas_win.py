@@ -174,7 +174,6 @@ ULW_ALPHA = 2
 WM_USER, WM_APP = 0x400, 0x8000
 WM_APPBAR = WM_USER + 257
 WM_COMMANDS = WM_APP + 1         # hay órdenes en la cola de la aplicación
-WM_PREVIEW = WM_APP + 2          # el hilo de dibujo dejó lista una imagen de la vista previa
 MM_MCINOTIFY = 0x3B9             # MCI: aviso de reproducción
 MCI_NOTIFY_SUCCESSFUL = 1        # … la canción terminó sola (no la detuvimos nosotros)
 WM_DISPLAYCHANGE = 0x7E
@@ -323,10 +322,9 @@ def _wndproc(hwnd, msg, wparam, lparam):
             return HTTRANSPARENT  # los clics pasan a la ventana de abajo
         app = _app_ref[0]
         if msg == WM_COMMANDS and app is not None:
-            app.drain_commands()
-            return 0
-        if msg == WM_PREVIEW and app is not None:
-            app.show_preview()
+            # No se toca Tk aquí dentro: esto corre en medio del despacho de mensajes de Tcl, y
+            # llamar a Tk de forma reentrante desde ahí lo tumbaba. Se hace en cuanto quede libre.
+            app.root.after_idle(app.drain_commands)
             return 0
         if msg == MM_MCINOTIFY and app is not None:
             if wparam == MCI_NOTIFY_SUCCESSFUL:  # los avisos de «abortada» llegan al cambiar de canción
@@ -958,6 +956,7 @@ class Settings:
         self.refreshers = []
         self.snapshot = copy.deepcopy(app.cfg)
         self.preview_photo = None
+        self.preview_job = None
         self.songs_key = None
         # muestras de color pintadas ahora, antes de que arranque el hilo de dibujo (cairo, un solo hilo)
         self.swatch_images = {key: self._swatch_image(key) for key, _n, _c in N.PALETTES}
@@ -1323,19 +1322,31 @@ class Settings:
         self._preview_on()
 
     # ---------- vista previa (la dibuja el hilo de dibujo, solo mientras la ventana se ve)
+    PREVIEW_POLL_MS = 33  # mientras la ventana se ve, se recoge la última imagen ~30 veces por segundo
+
     def _preview_on(self):
-        if self.visible():
-            self.app.renderer.set_preview(max(200, self.preview_lbl.winfo_width()))
+        if not self.visible():
+            return
+        self.app.renderer.set_preview(max(200, self.preview_lbl.winfo_width()))
+        if self.preview_job is None:
+            self.preview_job = self.root.after(self.PREVIEW_POLL_MS, self._poll_preview)
+
+    def _poll_preview(self):
+        self.preview_job = None
+        if not self.visible():
+            return
+        frame = self.app.take_preview()
+        if frame:
+            self.show_preview(frame)
+        self.preview_job = self.root.after(self.PREVIEW_POLL_MS, self._poll_preview)
 
     def show_preview(self, frame):
         """Muestra la imagen que dejó lista el hilo de dibujo (aquí no se usa cairo)."""
-        if not self.visible():
-            return
         w, h, stride, data = frame
-        trace(f"vista previa {w}x{h}")
         img = Image.frombuffer("RGBA", (w, h), data, "raw", "BGRa", stride, 1)
-        self.preview_photo = ImageTk.PhotoImage(img)
-        self.preview_lbl.configure(image=self.preview_photo, height=h)
+        photo = ImageTk.PhotoImage(img)
+        self.preview_lbl.configure(image=photo, height=h)
+        self.preview_photo = photo  # la anterior se libera después de dejar de usarse
 
     # ---------- botones
     def on_apply(self):
@@ -1359,6 +1370,9 @@ class Settings:
     def _hide(self):
         self.root.withdraw()
         self.app.renderer.set_preview(None)
+        if self.preview_job:
+            self.root.after_cancel(self.preview_job)
+            self.preview_job = None
 
     def close_to_background(self):
         """Oculta la ventana; las luces siguen. Avisa cómo volver (salvo que pidan no hacerlo)."""
@@ -1566,7 +1580,6 @@ class App:
         self.sfx.volume = self.cfg["fx_volume"]
         self.preview_lock = threading.Lock()
         self.preview_frame = None    # última imagen de la vista previa, esperando a Tk
-        self.preview_posted = False
         # Lo que dibuja con cairo fuera del hilo de dibujo va antes de que este arranque
         self.settings = Settings(self, self.root)
         self.tray = Tray(self)
@@ -1651,19 +1664,14 @@ class App:
         self.music.set_enabled(self.cfg["music"] and self.cfg["power"])
 
     def deliver_preview(self, w, h, stride, data):
-        """Desde el hilo de dibujo: guarda la última imagen y avisa a Tk (un aviso a la vez)."""
+        """Desde el hilo de dibujo: deja la última imagen de la vista previa (reemplaza la anterior)."""
         with self.preview_lock:
             self.preview_frame = (w, h, stride, data)
-            if self.preview_posted:
-                return  # Tk aún no tomó la anterior: se la reemplaza, sin acumular avisos
-            self.preview_posted = True
-        self.msgwin.post(WM_PREVIEW)
 
-    def show_preview(self):
+    def take_preview(self):
         with self.preview_lock:
-            frame, self.preview_frame, self.preview_posted = self.preview_frame, None, False
-        if frame and not self.quitting:
-            self.settings.show_preview(frame)
+            frame, self.preview_frame = self.preview_frame, None
+        return frame
 
     def effect_fps(self):
         f = self.cfg.get("fluidez", "auto")

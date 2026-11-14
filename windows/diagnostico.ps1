@@ -29,7 +29,9 @@ foreach ($k in $casos) {
   if ($k.o) { (Start-Process $exe -ArgumentList "--opciones" -PassThru).WaitForExit(15000) | Out-Null; Start-Sleep -Seconds 3 }
   if (-not $k.noapagar) { (Start-Process $exe -ArgumentList "--alternar" -PassThru).WaitForExit(15000) | Out-Null }
   Start-Sleep -Seconds 12
-  if ($p.HasExited) { $r = "MURIÓ 0x{0:X8}" -f $p.ExitCode } else { $r = "vivo"; Stop-Process -Id $p.Id -Force; Start-Sleep 2 }
+  if ($p.HasExited) { $r = "MURIÓ 0x{0:X8}" -f $p.ExitCode } else { $r = "vivo" }
+  Get-Process LucesNavidenas -ErrorAction SilentlyContinue | Stop-Process -Force  # ninguna copia pasa al caso siguiente
+  Start-Sleep 2
   Write-Host ("{0,-42} {1}" -f $k.n, $r)
   $id = $k.n.Substring(0, 1)
   Copy-Item (Join-Path $datos "registro.txt") (Join-Path $out "$id-registro.txt") -ErrorAction SilentlyContinue
